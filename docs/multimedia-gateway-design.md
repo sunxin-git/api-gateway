@@ -1,10 +1,41 @@
 # 多媒体 AI 网关设计方案
 
-> **版本：** v1.2.4 **(P0 准入版，10/10 Yes)** —— 2026-05-25 经 7 轮 Codex 独立评审最终拿到 Yes 准入；评审报告见 `docs/reviews/codex-review-{v1,v1.1,v1.2,v1.2.1,v1.2.2,v1.2.3,v1.2.4}.md`。
+> **版本：** v1.3 **(reimplement 路线版)** —— 2026-05-25 由 grilling-with-docs 重新校准
 >
 > **🟢 P0 编码状态：可立即启动**
-> **范围：** 基于 `third-party/new-api` 二开，构建以多媒体（图像 / 视频 / 音频）模型为主、少量 LLM 为辅的商业化 AI API 网关。
+>
+> v1.3 在 v1.2.4 业务设计基础上调整**实现路线**，主要变化：
+> - 不再 fork new-api，改为 **reimplement-only**（详见 [ADR-0001](adr/0001-reimplement-only-no-fork-new-api.md)）
+> - 数据库统一 **PostgreSQL** 单选，删除 SQLite / MySQL 兼容路径（[ADR-0002](adr/0002-postgresql-only-no-multi-db.md)）
+> - 数据访问层 **sqlc + database/sql** 替代 GORM（[ADR-0003](adr/0003-sqlc-instead-of-gorm.md)）
+> - P0 范围扩入**完整 React UI**（[ADR-0004](adr/0004-p0-includes-full-react-ui.md)）
+> - 前端栈调整为业界主流版 **shadcn/ui + Vite + pnpm + Recharts**（[ADR-0005](adr/0005-frontend-stack-industry-mainstream.md)）
+>
+> **业务设计（账本 / 路由 / outbox / 状态机 / 计费 / OSS 月结 / Admin / Webhook）全部保留 v1.2.4 设计**，仅在实现层面替换。文档主体保留不动，仅在受影响章节顶部加 v1.3 修订提示。
+>
+> v1.2.4 的 7 轮 Codex 评审历史归档于 `docs/reviews/codex-review-{v1,v1.1,v1.2,v1.2.1,v1.2.2,v1.2.3,v1.2.4}.md`。
+> 术语统一表见 [`CONTEXT.md`](../CONTEXT.md)。
+>
+> **范围：** 以 reimplement 方式构建以多媒体（图像 / 视频 / 音频）模型为主、少量 LLM 为辅的商业化 AI API 网关，第一个集成 provider 为火山 seedance 2.0。
 > **核心目标：** 上游原始成本透明可审计，下游对客户支持「倍率 + 固定积分阶梯」两种计费方式，OSS / TOS 存储成本入账，所有计费规则在网关层可配置可叠加。
+>
+> **技术栈（v1.3）：**
+> ```
+> 后端: Go 1.25/1.26 + Gin v1.10 + sqlc + PostgreSQL + Asynq + Redis
+> 前端: React 19 + Vite + TypeScript + shadcn/ui + Tailwind 4 + pnpm
+>       TanStack Router/Query/Table + Zustand + react-hook-form + zod
+>       + lucide-react + Recharts + i18next (zh + en)
+> 观测: slog (JSON) + prometheus/client_golang + OpenTelemetry SDK
+> 认证: Session Cookie (HttpOnly, Secure) for UI；Admin Token for API
+> 密钥: GATEWAY_KEK_V* 环境变量起步，预留 KMS 切换接口
+> 工具: testify + dockertest + koanf + GitHub Actions
+> 布局: Monorepo (api-gateway/{main.go, cmd/admin-cli/, internal/, web/admin/})
+>       Go embed.FS 嵌入前端 dist
+> ```
+>
+> **P0 验收（v1.3）：** 1-2 个种子客户在生产灰度跑稳，第一个集成 provider = 火山 seedance 2.0。
+>
+> **P0 工期估算：** 18-22 天（AI Agent 中等并行 + milestone review，5 个 Phase；详见第十三章）
 >
 > **v1.2.3 Changelog（收尾 v1.2.2 自身引入 UPSTREAM_SUBMITTING 状态后漏改的 2 处同步项）：**
 > - **[v1.2.2-1 修正]** `UPSTREAM_SUBMITTING` 加崩溃恢复机制：task 表新增 `submit_locked_until`，超时 cron 任务（每 1 分钟）把卡住的 `UPSTREAM_SUBMITTING` CAS 回 `SUBMITTED`（最多 3 次），超出转 `FAILED`（见 9.5 与 9ter.7）。
@@ -79,7 +110,20 @@
 > 21. **【v1.2 新增】outbox 强制主库：** `webhook_event_outbox` 必须部署在主数据库，与 `business_account_ledger` 同库同事务；启动时 fail-fast 校验（main DB schema 必须含 outbox 表）；LOG_SQL_DSN 拆库时 LOG_DB 只能存投递日志副本（`webhook_delivery_log`），不能存 outbox 本身。
 > 22. **【v1.2 新增】跨月任务 provisional + adjustment：** 月结按 `submitted_at` 归属，**不写死 24 小时窗口**；账期内未终结的任务首次月结时发 `billing.monthly_settle_provisional`，任务完成后发 `billing.monthly_adjustment` 冲销；6 月才确认的 5 月任务由 5 月调整账单收尾。
 > 23. **【v1.2 新增】KEK 保留期对齐：** 旧 KEK 保留期 = `max(任务最长执行期 30 天, Asynq DLQ 保留期, 财务审计补偿窗口 1 年)`；缺省 1 年；任务最长执行期硬上限 30 天，超时自动 EXPIRED 并退预扣。
-> 24. **落地方式：** v1.2 已达 Codex P0 编码准入标准；P0 收缩到 3-4 周。
+> 24. **落地方式（v1.2.4 原文）：** v1.2 已达 Codex P0 编码准入标准；P0 收缩到 3-4 周。
+>
+> **v1.3 修订条目（覆盖部分 v1.2.4 决策）：**
+> - **[v1.3 修订 13 / 新增 25]** 不再「基于 new-api 二开」，改为「**reimplement-only** + 架构思路参考」。详见 ADR-0001。
+> - **[v1.3 修订 13 / 新增 26]** 数据库不再三库兼容，统一 **PostgreSQL** 单选；所有 SQLite / MySQL 降级路径删除。详见 ADR-0002。
+> - **[v1.3 新增 27]** 数据访问层 **sqlc + database/sql**，不用 GORM。详见 ADR-0003。
+> - **[v1.3 新增 28]** P0 范围包含**完整 React UI**（6 个核心页面），不再推到 P1。详见 ADR-0004。
+> - **[v1.3 新增 29]** 前端栈调整为业界主流：**React 19 + Vite + shadcn/ui + Tailwind 4 + pnpm + lucide + Recharts**。详见 ADR-0005。
+> - **[v1.3 新增 30]** 项目骨架为 Monorepo + 单 main.go + `cmd/admin-cli/` + `internal/` + `web/admin/`，Go embed 嵌入前端。Module path `github.com/sunxin-git/api-gateway`。
+> - **[v1.3 新增 31]** 第一个集成 provider 为**火山 seedance 2.0**（与 v1.2.4 文档原生对应；最复杂场景先验证）。
+> - **[v1.3 新增 32]** 「团队」= **AI Agent 并行 + 人 review**：18-22 天工期假设中等并行（每 phase 2 Agent + milestone review），不是传统人月估算。
+>
+> **v1.3 不变条目（v1.2.4 业务设计全部保留）：**
+> 第 1-12 条全部不变；第 14-23 条全部不变。具体涉及：账本不变量、isolation_required 硬开关、outbox 主库强制、跨月 provisional/adjustment、KEK 保留期、任务双快照、Webhook outbox、Admin Token 安全等所有设计**完全不动**。
 
 ---
 
