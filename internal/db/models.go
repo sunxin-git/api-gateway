@@ -14,6 +14,51 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+// 操作来源类型；与 actor_id 配合构成结构化审计两列
+type ActorType string
+
+const (
+	ActorTypeAdminToken ActorType = "admin_token"
+	ActorTypeCli        ActorType = "cli"
+	ActorTypeSystem     ActorType = "system"
+	ActorTypeTask       ActorType = "task"
+)
+
+func (e *ActorType) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = ActorType(s)
+	case string:
+		*e = ActorType(s)
+	default:
+		return fmt.Errorf("unsupported scan type for ActorType: %T", src)
+	}
+	return nil
+}
+
+type NullActorType struct {
+	ActorType ActorType `json:"actor_type"`
+	Valid     bool      `json:"valid"` // Valid is true if ActorType is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullActorType) Scan(value interface{}) error {
+	if value == nil {
+		ns.ActorType, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.ActorType.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullActorType) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.ActorType), nil
+}
+
 type BusinessAccountStatus string
 
 const (
@@ -273,6 +318,8 @@ type BusinessAccountBalance struct {
 	FrozenReason pgtype.Text  `json:"frozen_reason"`
 	FrozenAt     sql.NullTime `json:"frozen_at"`
 	UpdatedAt    time.Time    `json:"updated_at"`
+	// 已聚合到的最大 ledger.id（投影游标 + rebuild CAS 锚点）
+	LastLedgerID int64 `json:"last_ledger_id"`
 }
 
 // 账本不可变流水：所有扣减 / 退款 / 对账的唯一真相源（CONTEXT.md ledger）
@@ -287,6 +334,24 @@ type BusinessAccountLedger struct {
 	IdempotencyKey pgtype.Text `json:"idempotency_key"`
 	Snapshot       []byte      `json:"snapshot"`
 	CreatedAt      time.Time   `json:"created_at"`
+	// 此 entry 对 available 余额的影响（reconciler SUM 用）
+	AvailableDelta int64 `json:"available_delta"`
+	// 此 entry 对 reserved 余额的影响
+	ReservedDelta int64 `json:"reserved_delta"`
+	// 此 entry 对 used_total 累计的影响
+	UsedDelta int64 `json:"used_delta"`
+	// 关联实体类型：task / topup_order / manual_adjust / monthly_settle
+	ReferenceType pgtype.Text `json:"reference_type"`
+	// 关联实体 ID（如 task_id）
+	ReferenceID pgtype.Text `json:"reference_id"`
+	// 业务侧附加标签（jsonb；不含 PII 原值）
+	Metadata []byte `json:"metadata"`
+	// 操作来源（结构化审计两列）
+	ActorType ActorType `json:"actor_type"`
+	// 操作者 ID（admin_token id / cli username / system component / task id）
+	ActorID string `json:"actor_id"`
+	// 充值幂等命中时比对的 canonical body sha256；防沉默篡改
+	CanonicalBodySha256 []byte `json:"canonical_body_sha256"`
 }
 
 // 渠道：一组上游 provider 凭据的抽象（CONTEXT.md channel）

@@ -6,22 +6,140 @@ package db
 
 import (
 	"context"
-	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Querier interface {
-	// smoke.sql —— Phase 1 探活查询
+	// 结算（无残余，actualCost == reserveAmount）：只 INSERT commit + UPDATE balance。
+	// 与 CommitWithReleaseAtomic 同语义，但少一条 release entry，sqlc 类型推导更干净。
+	CommitAtomic(ctx context.Context, arg CommitAtomicParams) (CommitAtomicRow, error)
+	// 结算（含部分释放残余）：actualCost < reserveAmount 时用本 query。
+	// 一次性 INSERT commit + release 两条 entry + UPDATE balance。
+	// CAS：不查 frozen；含 reserved >= @reserve_amount AND version=?
 	//
-	// 目的：sqlc 在没有任何业务 query 的情况下也能跑通 generate；
-	//      同时作为 internal/db 包诞生的最小种子，避免空目录导致 go build 报错。
+	// 参数：
+	//   @reserve_amount, @actual_cost, @release_amount = reserve_amount - actual_cost
+	//   @release_correlation_id = correlation_id + ":release"
 	//
-	// 命名说明：文件名不能以 `_` 开头，否则生成的 Go 文件 (`_smoke.sql.go`) 会被 go build
-	//          按官方约定忽略（`_` / `.` 前缀文件跳过编译），导致接口实现缺失。
+	// 返回 commit + release 两条 ledger 信息 + 新 balance。
+	CommitWithReleaseAtomic(ctx context.Context, arg CommitWithReleaseAtomicParams) (CommitWithReleaseAtomicRow, error)
+	// business_account.sql —— 业务账户 CRUD
 	//
-	// 生命周期：Phase 2+ 真业务 query（ledger.sql / outbox.sql 等）合入后可保留
-	//          作为运行时健康探针，或删除并由真实查询取代。
-	// 返回数据库当前时间，用于 /readyz 探活与生成代码烟雾测试。
-	HealthProbe(ctx context.Context) (time.Time, error)
+	// 适用范围：账户创建（同事务建 balance 行）/ 读取 / 入口 active 校验。
+	// 实现层：internal/ledger/postgres.go CreateAccount + 通用查询。
+	//
+	// 说明：CreateBusinessAccount 仅插入 business_account 主表；
+	//       同事务的 business_account_balance(zeros) 由调用方在同一 pgx.Tx 中
+	//       另起一条 INSERT（详见 ledger.sql 与 service 实现），便于复用 BalanceRow。
+	// 创建业务账户主记录；调用方负责在同一事务内插入 balance(zeros) 与 outbox 事件。
+	CreateBusinessAccount(ctx context.Context, arg CreateBusinessAccountParams) (BusinessAccount, error)
+	// 创建账户的零值 balance 行（与 CreateBusinessAccount 同事务）。
+	CreateBusinessAccountBalanceZero(ctx context.Context, businessAccountID string) (BusinessAccountBalance, error)
+	// Commit/Release 前置校验：找同 correlation_id 的 active reserve（未 commit / release）。
+	// NOT EXISTS 子查询确认同 correlation_id 没有 commit/release entry。
+	FindActiveReserveByCorrelation(ctx context.Context, arg FindActiveReserveByCorrelationParams) (FindActiveReserveByCorrelationRow, error)
+	// 用于区分「未找到 reserve」与「reserve 已 commit/release」（service 用以返回不同 sentinel）。
+	FindAnyReserveByCorrelation(ctx context.Context, arg FindAnyReserveByCorrelationParams) (FindAnyReserveByCorrelationRow, error)
+	// 通用反查：Reserve/Commit/Release/Refund 幂等用此 query 检查同 correlation_id+entry_type 是否已存在。
+	FindLedgerEntryByCorrelationAndType(ctx context.Context, arg FindLedgerEntryByCorrelationAndTypeParams) (FindLedgerEntryByCorrelationAndTypeRow, error)
+	// ============================================================================
+	// 2. 幂等查询
+	// ============================================================================
+	// 充值幂等命中查询：service 命中后比对 canonical_body_sha256，相同返原 entry，不同 ErrIdempotencyConflict。
+	FindLedgerEntryByIdempotencyKey(ctx context.Context, arg FindLedgerEntryByIdempotencyKeyParams) (FindLedgerEntryByIdempotencyKeyRow, error)
+	// 冻结账户余额：CAS 含 frozen=false AND version=?
+	// 已 frozen 返回 0 行；service 判幂等成功（不视为错误）。
+	// 不写 ledger entry（frozen 是 balance 字段，不涉及金额流水）；调用方自行写 outbox。
+	FreezeAtomic(ctx context.Context, arg FreezeAtomicParams) (BusinessAccountBalance, error)
+	// balance.sql —— 账户余额投影读取
+	//
+	// 写路径由 ledger.sql 的 CTE 单语句完成（INSERT ledger + UPDATE balance）；
+	// 本文件仅承载读路径 + rebuild 专用的 ReplaceBalance（绕过 CAS 的写）。
+	// 标准读取：用于 service.GetBalance + admin-cli 反查 + 测试断言。
+	GetBalance(ctx context.Context, businessAccountID string) (BusinessAccountBalance, error)
+	// 行级 FOR UPDATE 读：rebuild TX3 用，防并发 Commit/Release 写入。
+	GetBalanceForUpdate(ctx context.Context, businessAccountID string) (BusinessAccountBalance, error)
+	// 事务内读取：与 GetBalance 等价，但显式由 service 在 CAS 失败后的同一 tx 调用。
+	// 保留独立 query 命名，便于 grep 出「事务内读」语义。
+	GetBalanceInTx(ctx context.Context, businessAccountID string) (BusinessAccountBalance, error)
+	// 读取业务账户主记录（用于反查 / 管理后台展示）。
+	GetBusinessAccount(ctx context.Context, id string) (BusinessAccount, error)
+	// 入口校验：仅返回 status + isolation_required，避免拉全字段；
+	// service 层在写操作入口先调用此 query 判 status='active'。
+	GetBusinessAccountForActiveCheck(ctx context.Context, id string) (GetBusinessAccountForActiveCheckRow, error)
+	// ============================================================================
+	// 4. rebuild 全量读
+	// ============================================================================
+	// rebuild TX2 用：按 id ASC 全量取 ledger，应用层累加得 expected balance。
+	// ORDER BY id 保证回放顺序与原写入顺序一致（虽然累加是可交换的，方便审计）。
+	GetLedgerEntriesForRebuild(ctx context.Context, businessAccountID string) ([]GetLedgerEntriesForRebuildRow, error)
+	// outbox.sql —— webhook_event_outbox 写路径
+	//
+	// 本工作流仅实现 INSERT；dispatcher（claim/lease 抢占 + 推送 + DLQ）由 C-min 落地。
+	// 同事务 INSERT outbox event；retention_until / is_financial / delivery_idempotency_key 由调用方算好。
+	// delivery_status 默认 'pending'，等待 dispatcher 扫描。
+	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (WebhookEventOutbox, error)
+	// reconciler 全表扫起点：仅取 ID + 当前 version；后续读 SUM 时再单只读 tx 中拉一致快照。
+	ListAllUnfrozenAccountsForReconciler(ctx context.Context) ([]ListAllUnfrozenAccountsForReconcilerRow, error)
+	// reconciler 收尾 watchdog：扫出处于 rebuild_in_progress 状态且 frozen 时间过长的账户。
+	//
+	// 用途：U8 RebuildBalance 三事务流程中第二阶段崩溃 / 进程被 kill 时，账户会停留在
+	// frozen=true + reason 含 'rebuild_in_progress' 状态；本查询给 reconciler 暴露 metric
+	// 让运维及时发现并人工恢复（pass-2 sec sec-pass2-008）。
+	//
+	// @threshold 参数取自 reconciler.rebuildStuckThreshold（默认 10 分钟）。
+	ListStuckRebuildAccounts(ctx context.Context, threshold pgtype.Interval) ([]ListStuckRebuildAccountsRow, error)
+	// ledger.sql —— 账本流水写入 + 幂等查询 + drift 聚合 + rebuild 全量读
+	//
+	// 设计文档：docs/multimedia-gateway-design.md §3ter
+	// 实施计划：docs/plans/2026-05-26-002-...-plan.md Unit 2
+	//
+	// 写操作统一走 PG CTE 单语句模式：
+	//   WITH new_entry AS (INSERT INTO business_account_ledger ... RETURNING ...)
+	//   UPDATE business_account_balance SET ... WHERE CAS 条件 RETURNING ...
+	//
+	// 关键 PG 语义（务必牢记）：
+	//   data-modifying CTE 即使最终 SELECT 0 行，sibling INSERT 仍**执行到完成**。
+	//   原子性靠 tx 级 ROLLBACK 保证 —— service 在 pgx.ErrNoRows 时**必须**显式 tx.Rollback。
+	//
+	// sqlc 命名参数注意：
+	//   sqlc v1.30.0 对 `-@param`（紧贴一元负号）解析有 bug，会把 `@param` 留在生成 SQL 中。
+	//   解决：所有负值表达式写成 `(0 - @param)::bigint`，sqlc 能正确替换为 `(0 - $N)::bigint`。
+	//
+	// CAS 字段策略：
+	//   - Recharge / Reserve   含 frozen = false（拒绝冻结账户的新入金 / 预占）
+	//   - Commit / Release / Refund / Freeze / Unfreeze   不查 frozen（允许 inflight 完成 + 管理动作）
+	//   - 所有写都含 version = @expected_version 防丢失更新
+	// ============================================================================
+	// 1. 写操作：CTE 单语句（INSERT ledger + UPDATE balance）
+	// ============================================================================
+	// 充值：available 增 + recharge_total 增；CAS WHERE frozen=false AND version=?
+	// 0 行 = CAS 失败（frozen / version 冲突）；service 同 tx 内 fresh-read 判错。
+	RechargeAtomic(ctx context.Context, arg RechargeAtomicParams) (RechargeAtomicRow, error)
+	// 退款：used_total 减 + available 增 + refund_total 增；CAS 含 used_total >= @amount AND version=?
+	// 不查 frozen（管理动作允许）。refund_total 不进不变量等式，单独自增。
+	RefundAtomic(ctx context.Context, arg RefundAtomicParams) (RefundAtomicRow, error)
+	// 释放预占：reserved 减 + available 增；CAS 含 reserved >= @amount AND version=?
+	// 不查 frozen（允许 inflight 完成）。
+	ReleaseAtomic(ctx context.Context, arg ReleaseAtomicParams) (ReleaseAtomicRow, error)
+	// rebuild TX3 专用：用 last_ledger_id CAS 校验「TX2 读快照后没有新 entry 写入」；
+	// 命中行数 = 0 表示并发漂移，调用方应回到 TX2 重读快照。
+	// 不参与日常写路径，绕开 version CAS（rebuild 期间 frozen=true 已阻新业务写）。
+	ReplaceBalance(ctx context.Context, arg ReplaceBalanceParams) (int64, error)
+	// 预占：available 减 + reserved 增；CAS 含 available >= @amount AND frozen=false AND version=?
+	// available_delta 用 (0::bigint - @amount)::bigint 表达负值（sqlc 解析必须）。
+	ReserveAtomic(ctx context.Context, arg ReserveAtomicParams) (ReserveAtomicRow, error)
+	// ============================================================================
+	// 3. drift reconciler 聚合
+	// ============================================================================
+	// reconciler 用：对单个账户的全部 ledger entry SUM 各 delta，
+	// 与 balance 表比对得 drift。recharge_sum / refund_sum 用 FILTER 仅累加对应 entry_type。
+	// COALESCE 兜底 NULL（账户 0 条 ledger 时 SUM 返回 NULL）。
+	SumLedgerDeltasByAccount(ctx context.Context, businessAccountID string) (SumLedgerDeltasByAccountRow, error)
+	// 解冻：CAS 含 frozen=true AND version=?；frozen_reason 重写为新值（rebuild_completed / manual_unfreeze）。
+	// 0 行 = 已 unfrozen（幂等成功）或 version 冲突。
+	UnfreezeAtomic(ctx context.Context, arg UnfreezeAtomicParams) (BusinessAccountBalance, error)
 }
 
 var _ Querier = (*Queries)(nil)

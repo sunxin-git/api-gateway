@@ -111,7 +111,58 @@ docker compose logs postgres   # 查启动日志
 
 ---
 
-## 5. 文件树速览
+## 5. 运维场景
+
+### 5.1 Migration 部署流程（生产环境关键）
+
+生产环境跑 migration 前**必须**先暂停 reconciler，避免 ALTER TABLE 的 ACCESS EXCLUSIVE 锁与 reconciler 全表 SELECT 死锁。
+
+```bash
+# 方式 A（Linux / macOS）：SIGUSR1 暂停 reconciler，不停整个 gateway
+kill -SIGUSR1 <gateway-pid>
+
+# 等 5s 让正在跑的 reconciler 轮结束，然后跑 migration
+sleep 5
+make migrate-up
+
+# 完成后再次 SIGUSR1 恢复 reconciler
+kill -SIGUSR1 <gateway-pid>
+```
+
+```bash
+# 方式 B（跨平台 / Windows 必用）：直接停 gateway 进程
+systemctl stop api-gateway   # 或 docker stop / pkill 视部署方式
+make migrate-up
+systemctl start api-gateway
+```
+
+**关于 0002 down migration**：
+
+- 0002 down.sql 首行 DO 块自动检查 `business_account_ledger` 是否有数据，**有数据则 RAISE 异常**拒绝执行
+- 生产环境 rollback **永远走代码热修**，不要回退 schema（DROP COLUMN 会丢审计字段）
+
+### 5.2 Rebuild stuck 恢复 runbook（账户陷 frozen+rebuild_in_progress 时）
+
+收到告警 `gateway_ledger_rebuild_stuck_total{account_id=X} > 0` 时：
+
+1. 查 slog 找到 rebuild 失败的根因（多为高并发 CAS 重试耗尽）
+2. SIGUSR1 暂停 reconciler，避免它继续干扰
+3. 临时 Go 脚本调用 `LedgerService.RebuildBalance(ctx, actor={system:ops}, accountID)`
+   - P0 阶段无 admin-cli 子命令；未来 D-min HTTP / P1 admin-cli 会加暴露
+4. 验证 `GetBalance` 返回正确投影 + 账户 unfrozen
+5. SIGUSR1 恢复 reconciler
+6. 在 `docs/solutions/` 写入复盘（一次性事故 + 根因 + 永久修复方案）
+
+### 5.3 Drift 检测切换流程（P0 dry-run → P1 freeze）
+
+- P0 部署默认 `LEDGER_DRIFT_ACTION=log`（dry-run）
+- 生产跑 1-2 周观察 `gateway_ledger_drift_total{action=dry_run}` 与 `gateway_ledger_drift_false_positive_total`
+- 14 天零 drift（false positives < 1% 也可接受）→ 切 `LEDGER_DRIFT_ACTION=freeze` 重启
+- 切换前后都有 page 告警（不同 severity）防真 drift 被吞噬
+
+---
+
+## 6. 文件树速览
 
 参见根目录 `README.md` 或本计划文档：[`docs/plans/2026-05-26-001-feat-phase-1-skeleton-and-migrations-plan.md`](plans/2026-05-26-001-feat-phase-1-skeleton-and-migrations-plan.md)。
 
@@ -126,10 +177,11 @@ docker compose logs postgres   # 查启动日志
 
 ---
 
-## 6. 进一步阅读
+## 7. 进一步阅读
 
 - 项目宪法：[`CLAUDE.md`](../CLAUDE.md)
 - 主设计文档：[`docs/multimedia-gateway-design.md`](multimedia-gateway-design.md)
 - 5 份 ADR：[`docs/adr/`](adr/)
 - 术语表：[`CONTEXT.md`](../CONTEXT.md)
-- 当前 schema 快照：[`docs/db/schema-v0001.md`](db/schema-v0001.md)（U7 完成后存在）
+- 当前 schema 快照：[`docs/db/schema.md`](db/schema.md)
+- 计划归档：[`docs/plans/`](plans/)

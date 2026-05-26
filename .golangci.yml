@@ -47,6 +47,7 @@ linters:
       enable-all: true
       disable:
         - fieldalignment    # 触发频繁、对热路径之外作用有限
+        - shadow            # `if err := ...; err != nil` 嵌套 err 是 Go 习语，shadow 误报多
 
     staticcheck:
       checks:
@@ -54,7 +55,12 @@ linters:
 
     errcheck:
       check-type-assertions: true
-      check-blank: true
+      # _ = f() 显式忽略错误是 Go 习语（defer tx.Rollback / json.Marshal of typed struct
+      # / 测试 cleanup 等场景）。check-blank: true 过于严格，关闭。
+      check-blank: false
+      # 显式列出可被忽略错误的函数（pgx tx.Rollback 在 commit 后必返 ErrTxClosed，预期）
+      exclude-functions:
+        - (github.com/jackc/pgx/v5.Tx).Rollback
 
     gosec:
       excludes:
