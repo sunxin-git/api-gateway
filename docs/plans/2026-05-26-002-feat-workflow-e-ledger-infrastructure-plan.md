@@ -1,9 +1,11 @@
 ---
 title: 工作流 E — 账本基础设施（Phase 2）
 type: feat
-status: active
+status: completed
 date: 2026-05-26
 deepened: 2026-05-26
+completed: 2026-05-26
+implementation_pr: https://github.com/sunxin-git/api-gateway/pull/2
 origin: docs/multimedia-gateway-design.md §3ter + §16 工作流 E、CONTEXT.md「账本」、ADR-0003
 ---
 
