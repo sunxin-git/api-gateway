@@ -1,0 +1,104 @@
+name: CI
+
+# 触发：PR + 主线 push
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# 同时只跑一份（同 PR 内新 push 取消上一份）
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  build-test:
+    name: build / test / lint / sqlc / migrations
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["1.25.x"]
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: gateway
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      PG_DSN: "postgres://gateway:gateway_dev@localhost:5432/gateway?sslmode=disable"
+      # 仅 CI 用占位，不暴露真实密钥
+      GATEWAY_KEK_V1: "Y2lfa2VrX3BsYWNlaG9sZGVyXzMyX2J5dGVzX2Jhc2U2NA=="
+      ADMIN_TOKEN_SIGNING_KEY: "ci_signing_key_placeholder_64_hex_chars_for_test_use_only_aabbccdd"
+      # 工具版本（与 Makefile 中一致）
+      MIGRATE_VERSION: "v4.18.3"
+      GOLANGCI_LINT_VERSION: "v2.12.2"
+      GOTOOLCHAIN: "local"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Modules download + verify
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Go build
+        run: |
+          go build ./...
+          go build -o /tmp/gateway .
+          go build -o /tmp/admin-cli ./cmd/admin-cli
+
+      - name: Setup golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --timeout=5m
+
+      - name: Install golang-migrate
+        run: |
+          curl -sSL -o /tmp/migrate.tar.gz \
+            "https://github.com/golang-migrate/migrate/releases/download/${MIGRATE_VERSION}/migrate.linux-amd64.tar.gz"
+          tar -xzf /tmp/migrate.tar.gz -C /tmp
+          sudo mv /tmp/migrate /usr/local/bin/migrate
+          migrate -version
+
+      - name: sqlc compile + diff guard
+        run: |
+          make sqlc-compile
+          make sqlc-diff
+
+      - name: Migrations smoke test (up → down → up)
+        run: |
+          make migrate-up
+          make migrate-down
+          make migrate-up
+
+      - name: Unit tests
+        run: make test
+
+      - name: Reimplement guard (ADR-0001 兜底)
+        run: make reimpl-guard

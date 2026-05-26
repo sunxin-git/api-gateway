@@ -1,0 +1,47 @@
+# sqlc 配置文件（v2 schema）
+#
+# 用途：从 sql/queries/*.sql + migrations/*.up.sql 自动生成类型安全的 Go DAO 代码。
+# 详见 ADR-0003（sqlc-instead-of-gorm）。
+#
+# Phase 1 状态：仅占位 _smoke.sql（HealthProbe 一条），用于跑通生成管线。
+# Phase 2+ 业务工作流引入 ledger.sql / outbox.sql / admin.sql / task.sql 等真实查询。
+#
+# 注意事项：
+# 1. queries 与 schema 都用相对路径（相对本 yaml 所在目录）。schema 指向 ../migrations，
+#    sqlc 会读取所有 .up.sql 推导 schema（无需 down.sql）。
+# 2. out 是 internal/db，相对仓库根；sqlc 自动按当前 yaml 路径解析为 ../internal/db。
+# 3. sql_package 选 pgx/v5 是 ADR-0002 + ADR-0003 决定：PG 唯一 + pgx 性能 / 类型映射最完整。
+# 4. emit_interface=true 是 DIP 要求：service 层依赖接口而非具体实现，便于测试注入。
+# 5. overrides 处理 jsonb / timestamptz 的 Go 类型映射，避免 sqlc 默认推导成 pgtype.Timestamptz。
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "queries"
+    schema: "../migrations"
+    gen:
+      go:
+        package: "db"
+        out: "../internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: false
+        emit_interface: true
+        emit_exact_table_names: false
+        emit_empty_slices: true
+        overrides:
+          # jsonb 字段统一映射为 []byte（slice of byte），service 层自行解析为 struct
+          - db_type: "jsonb"
+            go_type:
+              type: "byte"
+              slice: true
+          # timestamptz 直接用 time.Time，不用 pgtype.Timestamptz（业务层 zero value 处理更直观）
+          - db_type: "timestamptz"
+            go_type:
+              import: "time"
+              type: "Time"
+          # 可空 timestamptz：用 sql.NullTime
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              import: "database/sql"
+              type: "NullTime"

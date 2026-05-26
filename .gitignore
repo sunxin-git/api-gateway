@@ -22,6 +22,15 @@ playwright-report/
 test-results/
 *.tsbuildinfo
 
+# Go
+# /bin/ 收 make build / make install-tools 输出（含 migrate.exe / golangci-lint.exe）
+/bin/
+# go test 二进制 / cover 输出
+*.test
+*.out
+coverage.txt
+profile.cov
+
 
 
 # IDE
