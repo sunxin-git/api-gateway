@@ -177,6 +177,9 @@ Single-context layout (`CONTEXT.md` + `docs/adr/` at repo root). See `docs/agent
 - 主设计文档：[docs/multimedia-gateway-design.md](docs/multimedia-gateway-design.md) (v1.3+)
 - 决策记录：[docs/adr/](docs/adr/) 当前 0001-0005
 - 术语表：[CONTEXT.md](CONTEXT.md)
+- Schema 快照：[docs/db/schema-v0001.md](docs/db/schema-v0001.md)
+- 本地开发指南：[docs/dev-setup.md](docs/dev-setup.md)
+- 计划归档：[docs/plans/](docs/plans/)
 - Codex 评审历史：[docs/reviews/](docs/reviews/) 7 轮迭代归档
 - 网关选型对比：[docs/模型网关选型建议.md](docs/模型网关选型建议.md)
 - new-api 技术分析（只读参考）：[docs/new-api-technical-analysis.md](docs/new-api-technical-analysis.md)

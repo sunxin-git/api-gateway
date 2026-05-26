@@ -1,0 +1,131 @@
+# golangci-lint 配置 — api-gateway
+#
+# 设计原则：
+# - 全量开启稳定且高信噪比的 linter（govet/staticcheck 等），关闭噪声大的（深度检查交给 review）
+# - depguard 用作 ADR-0001 reimplement-only 的静态守门
+# - 不开 deprecated linter（如 golint / interfacer / maligned 已废弃）
+
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+  go: "1.25"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/sunxin-git/api-gateway)
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - errcheck
+    - gocritic
+    - gosec
+    - sqlclosecheck
+    - depguard
+    - misspell
+    - unconvert
+    - bodyclose
+    - copyloopvar
+    - revive
+
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment    # 触发频繁、对热路径之外作用有限
+
+    staticcheck:
+      checks:
+        - all
+
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+
+    gosec:
+      excludes:
+        - G104  # errors.New 错误未处理 — 由 errcheck 处理
+        - G101  # hardcoded credentials — .env.example 内含占位字符串会误报
+
+    revive:
+      severity: warning
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+          arguments:
+            - "checkPrivateReceivers"
+            - "disableStutteringCheck"
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unused-parameter
+          disabled: true        # 占位 RunE 大量 unused
+        - name: unreachable-code
+        - name: redefines-builtin-id
+
+    depguard:
+      rules:
+        no-new-api-import:
+          list-mode: lax
+          deny:
+            - pkg: github.com/QuantumNous/new-api
+              desc: "ADR-0001 reimplement-only：禁止 import new-api 任何包"
+            - pkg: github.com/songquanpeng/one-api
+              desc: "同上游约束，ADR-0001 reimplement-only"
+
+  exclusions:
+    paths:
+      - third-party
+      - vendor
+      - internal/db        # sqlc 生成代码不做 lint
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # tools.go 是 build-tag 标记的工具锁定文件
+      - path: tools\.go
+        linters:
+          - unused
+          - revive
+          - gosec
+
+      # 测试文件放宽 errcheck
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

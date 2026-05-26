@@ -1,0 +1,61 @@
+# api-gateway 本地开发环境
+#
+# 使用方法：
+#   cp .env.example .env.local      # 首次：复制环境变量样板
+#   make dev-up                     # 启动 PG + Redis
+#   make migrate-up                 # 应用 schema migrations
+#   make run                        # 启动网关
+#
+# 销毁：
+#   make dev-down                   # 停止容器（保留数据卷）
+#   make dev-clean                  # 停止并删除数据卷（破坏性）
+#
+# 注意：本文件仅供本地开发；生产部署不走 docker-compose。
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: api-gateway-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      # 仅本地开发密码，**勿在任何生产环境复用**
+      POSTGRES_PASSWORD: gateway_dev
+      # 启用 PG 时区
+      TZ: Asia/Shanghai
+      PGTZ: Asia/Shanghai
+    ports:
+      # 主机暴露 55432 避免与本地已装 PG 服务冲突；容器内仍是 5432
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: api-gateway-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    ports:
+      # 主机暴露 56379 避免与本地已装 Redis 服务冲突；容器内仍是 6379
+      - "127.0.0.1:56379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  pgdata:
+    name: api-gateway-pgdata
+  redisdata:
+    name: api-gateway-redisdata
