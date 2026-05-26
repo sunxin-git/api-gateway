@@ -1,24 +1,33 @@
-# Schema v0001 —— 初始 schema 总览
+# Schema 总览（当前生效版本）
 
-> **migration 文件**：`migrations/0001_init.up.sql` / `migrations/0001_init.down.sql`
-> **生效版本**：Phase 1（P0 必需 9 张表 + 5 个枚举）
+> **当前 migration 版本**：0002
+> **migration 文件**：`migrations/0001_init.{up,down}.sql` + `migrations/0002_ledger_fields_extension.{up,down}.sql`
 > **PG 版本要求**：≥ 15（项目宪法 CLAUDE.md 技术栈）
-> **生成时间**：2026-05-26
+> **本文档命名约定**：不带版本号，永远描述「当前生效 schema」；每次 migration 后增量加章节
 >
 > 本文档是 schema 的**人类可读版**，配合 .sql 文件一起 review。
-> 字段、类型、约束、索引均与 .up.sql 一一对应；偏差被视为 bug，必须修复其中一方。
+> 字段、类型、约束、索引均与 migration 文件一一对应；偏差被视为 bug，必须修复其中一方。
+
+---
+
+## Migration 演化时间线
+
+| 版本 | 日期 | 内容 | 计划 |
+|---|---|---|---|
+| 0001 | 2026-05-26 | 初始 9 张表 + 5 个枚举 + 账本不变量 CHECK + 非负 CHECK | [Phase 1 plan](../plans/2026-05-26-001-feat-phase-1-skeleton-and-migrations-plan.md) |
+| 0002 | 2026-05-26 | ledger 字段扩展（delta/reference/metadata/actor_type/actor_id/canonical_body_sha256）+ balance.last_ledger_id + 不可变 trigger（UPDATE/DELETE/TRUNCATE）+ entry-level CHECK + 复合 UNIQUE 索引（idempotency_key per entry_type、correlation_id per type）+ REVOKE 高危权限 + actor_type 枚举 | [Phase 2 工作流 E plan](../plans/2026-05-26-002-feat-workflow-e-ledger-infrastructure-plan.md) |
 
 ---
 
 ## 顶部：偏离记录（与 v1.3 设计文档的差异）
 
-本初始 schema 是 **P0 最小实现**，按 v1.3 §16 收敛后的 4 条工作流前置依赖落地。
-以下记录与设计文档章节的**已知差异**，均经 plan 评审后确认为 P0 简化：
+以下记录与设计文档章节的**已知差异**，均经 plan 评审后确认：
 
 | 表 | 设计文档章节 | 差异内容 | 处理方式 |
 |---|---|---|---|
-| `business_account_ledger` | §3ter.2 | 设计文档列出 `available_delta` / `reserved_delta` / `used_delta` / `reference_type` / `reference_id` / `created_by` / `metadata` 字段；P0 schema **不含**这些。 | Phase 2 工作流 E 落地时按 `ALTER TABLE ADD COLUMN` 增量补充（用 0002+ migrations） |
-| `business_account_balance` | §3ter.2 | 设计文档含 `last_ledger_id` 投影游标字段；P0 schema **不含**。 | Phase 2 工作流 E 落地时增量补充 |
+| `business_account_ledger` | §3ter.2 | ~~设计文档列出 `available_delta` / `reserved_delta` / `used_delta` / `reference_type` / `reference_id` / `metadata` / `created_by` 字段；P0 0001 schema 不含。~~ | ✅ **已在 0002 补齐**（含 `canonical_body_sha256` 额外字段供幂等 body 校验） |
+| `business_account_balance` | §3ter.2 | ~~设计文档含 `last_ledger_id` 投影游标字段；P0 0001 schema 不含。~~ | ✅ **已在 0002 补齐** |
+| `business_account_ledger.created_by` | §3ter.2 | 设计文档用 `created_by varchar(64)` 单一字符串；本项目改用 `actor_type` enum + `actor_id` text 两列结构化审计 | 评审决策：防伪造（document-review pass 1 finding C11） |
 | `business_account` | §9bis.7 | 设计文档用 `id bigint PK + business_account_id varchar(64) UNIQUE` 双 ID；P0 schema 直接 `id text PK`（业务外部 ID）。设计文档还含 `business_account_type` / `display_name` / `admin_token_id` / `activated_at` / `suspended_at` 字段；P0 不含。 | P1+ 按需补；当前 P0 工作流 D-min 仅需开通 + 充值 + 余额查询 |
 | `gateway_admin_token` | §9bis.7 | 设计文档用 `business_system_name` + `status enum` + `last_used_at`；P0 schema 改用 `description` + `revoked_at` 时间戳标记 + 不存 last_used。 | P1 完整 Admin Token 管理 UI 落地时按需扩展（计划 Unit 7 字段列表为准） |
 | `webhook_subscription` | §9bis.7 | 设计文档用 `business_system_name + url + secret_cipher + events`；P0 schema 改用 `business_account_id FK + endpoint_url + hmac_secret_encrypted + key_version + event_types text[]`。 | P0 schema 字段更结构化（直接 FK 业务账户 + 数组事件类型）；P1 webhook 订阅管理 UI 时不变 |
@@ -346,5 +355,59 @@
 
 - **永远**通过 golang-migrate 跑 migrations，不允许在线手改 DB schema
 - **永远**配套写 `.up.sql` 和 `.down.sql`，down.sql 必须能完整撤销 up.sql
-- **永远**新增 schema 变更走新文件 `0002_xxx.up.sql`，**不**修改已合并的旧 migration
+- **永远**新增 schema 变更走新文件 `0003_xxx.up.sql` 等，**不**修改已合并的旧 migration
 - SQL 变更 PR 必须附 `EXPLAIN ANALYZE` 输出（CLAUDE.md 第六节）
+- **生产环境禁止 down 已有数据的 ledger 表**：0002 down.sql 首行 DO 块自动拦截
+
+---
+
+## 0002 字段增量（账本基础设施落地）
+
+> 计划：[docs/plans/2026-05-26-002-feat-workflow-e-ledger-infrastructure-plan.md](../plans/2026-05-26-002-feat-workflow-e-ledger-infrastructure-plan.md)
+> 评审：document-review pass 1 / pass 2 共识
+
+### 新增枚举
+
+| 类型 | 取值 | 用途 |
+|---|---|---|
+| `actor_type` | `admin_token` / `cli` / `system` / `task` | 结构化审计两列（与 `actor_id` 配对），防 created_by 自由字符串伪造 |
+
+### `business_account_ledger` 新增字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `available_delta` | bigint NOT NULL DEFAULT 0 | 此 entry 对 available 的影响（reconciler SUM 用） |
+| `reserved_delta` | bigint NOT NULL DEFAULT 0 | 此 entry 对 reserved 的影响 |
+| `used_delta` | bigint NOT NULL DEFAULT 0 | 此 entry 对 used_total 的影响 |
+| `reference_type` | text NULL | 关联实体类型：task / topup_order / manual_adjust / monthly_settle |
+| `reference_id` | text NULL | 关联实体 ID（如 task_id） |
+| `metadata` | jsonb NOT NULL DEFAULT '{}' | 业务侧附加标签（不含 PII 原值） |
+| `actor_type` | actor_type NOT NULL DEFAULT 'system' | 操作来源（结构化审计） |
+| `actor_id` | text NOT NULL DEFAULT 'bootstrap' | 操作者 ID |
+| `canonical_body_sha256` | bytea NULL | 充值幂等命中时比对的 canonical body sha256；防沉默篡改 |
+
+### `business_account_balance` 新增字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `last_ledger_id` | bigint NOT NULL DEFAULT 0 | 已聚合到的最大 ledger.id（投影游标 + rebuild CAS 锚点） |
+
+### 新增约束
+
+- **`chk_ledger_canonical_body_hash_len`**：`canonical_body_sha256` 必须为 32 字节（sha256 长度）
+- **`chk_ledger_delta_by_type`**：按 `entry_type` CASE 校验 `available_delta` / `reserved_delta` / `used_delta` 组合守恒（recharge / reserve / commit / release / refund 五种 entry_type 各自约束）
+
+### 新增索引
+
+- **`uq_ledger_idempotency_key_per_type`** UNIQUE `(entry_type, idempotency_key) WHERE idempotency_key IS NOT NULL` — 替代 0001 的全表 UNIQUE，让不同 entry_type 共用 key 字符串不撞索引
+- **`uq_ledger_correlation_per_type`** UNIQUE `(business_account_id, correlation_id, entry_type) WHERE correlation_id <> ''` — Reserve/Commit/Release/Refund 重试幂等
+- **`idx_ledger_reference`** `(reference_type, reference_id) WHERE reference_type IS NOT NULL` — 按业务实体反查
+
+### 新增 trigger
+
+- **`ledger_prevent_update_or_delete`** BEFORE UPDATE OR DELETE FOR EACH ROW — 阻止 ledger 修改 / 删除（应用层 + DB 双兜底）
+- **`ledger_prevent_truncate`** BEFORE TRUNCATE FOR EACH STATEMENT — 阻止 TRUNCATE（行 trigger 不覆盖此操作）
+
+### 权限调整
+
+- `REVOKE TRUNCATE, DELETE, UPDATE ON business_account_ledger FROM PUBLIC` — 双兜底，即便单一 connection 用户也无法跑高危操作（P1 进一步做 DB role 分级）

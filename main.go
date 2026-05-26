@@ -1,10 +1,18 @@
-// api-gateway 进程入口（Phase 1 骨架）。
+// api-gateway 进程入口（Phase 2 工作流 E Unit 10：pgxpool + reconciler + /readyz DB ping）。
 //
 // 启动流程：
 //  1. 加载配置（默认值 → .env.local → 进程 env，env 胜出，缺失必填项 fail-fast）。
 //  2. 初始化可观测性（slog logger / Prometheus metrics / OTel tracer provider）。
-//  3. 装配 httpapi.Server（Gin engine + 中间件链 + 骨架端点）。
-//  4. 监听 SIGINT/SIGTERM，收到信号后 30s graceful shutdown，超时强制 Close。
+//  3. **新增**：连接 PostgreSQL（pgxpool），Ping fail-fast；defer pool.Close()。
+//  4. **新增**：构造 LedgerService（PostgresService）+ OutboxPublisher + Reconciler。
+//  5. **新增**：注册 /readyz "postgres" 探针（pool.Ping）。
+//  6. 装配 httpapi.Server（Gin engine + 中间件链 + 骨架端点）。
+//  7. **新增**：启动 ReconcilerController（goroutine + SIGUSR1 暂停 handler，仅 Unix）。
+//  8. 监听 SIGINT/SIGTERM，收到信号后 30s graceful shutdown，超时强制 Close。
+//
+// 优雅停机顺序（计划 Unit 10 §graceful shutdown）：
+//
+//	SIGTERM/INT → HTTP server.Shutdown (30s) → ReconcilerController.Stop → pgxpool.Close
 package main
 
 import (
@@ -18,11 +26,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
 
 	"github.com/sunxin-git/api-gateway/internal/config"
 	"github.com/sunxin-git/api-gateway/internal/httpapi"
+	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/obs"
+	"github.com/sunxin-git/api-gateway/internal/outbox"
 )
 
 // 通过 ldflags 注入；Phase 1 默认值。
@@ -31,6 +42,23 @@ import (
 var (
 	version = "dev"
 	commit  = "dev"
+)
+
+// pgxpool 默认参数（与 internal/ledger/testutil.go 测试池一致量级）。
+//
+//   - MaxConns=25：Phase 2 单实例 QPS 估算 + reconciler 1 conn + 业务 ~10-20 conn 留余量；
+//     若上 D-min HTTP 后实际不够再调高（CLAUDE.md §六：依赖变更走 ADR）。
+//   - MinConns=5：避免冷启动首批请求建连抖动。
+//   - MaxConnLifetime=30min / MaxConnIdleTime=5min：与 PG 默认 idle_in_transaction_session_timeout 留余量。
+const (
+	dbMaxConns        = 25
+	dbMinConns        = 5
+	dbMaxConnLifetime = 30 * time.Minute
+	dbMaxConnIdleTime = 5 * time.Minute
+	// dbPingTimeout 启动期 pool.Ping 的超时（不可达即 fail-fast）。
+	dbPingTimeout = 5 * time.Second
+	// shutdownTimeout HTTP graceful shutdown 总预算。
+	shutdownTimeout = 30 * time.Second
 )
 
 func main() {
@@ -77,16 +105,51 @@ func run() error {
 		slog.String("log_level", cfg.LogLevel),
 		slog.String("otel_exporter", cfg.OTelExporter),
 		slog.Int("cors_allowed_origins", len(cfg.CORSAllowedOrigins)),
+		slog.String("ledger_drift_action", cfg.LedgerDriftAction),
 	)
 
-	// 第 3 步：装配 HTTP server。
+	// 第 3 步：连接 PostgreSQL（pgxpool）。Ping fail-fast。
+	pool, err := newPGXPool(cfg.PGDSN)
+	if err != nil {
+		return fmt.Errorf("初始化 pgxpool 失败: %w", err)
+	}
+	defer pool.Close()
+	logger.Info("pgxpool 初始化成功",
+		slog.Int("max_conns", dbMaxConns),
+		slog.Int("min_conns", dbMinConns),
+		slog.Duration("max_lifetime", dbMaxConnLifetime),
+		slog.Duration("max_idle", dbMaxConnIdleTime),
+	)
+
+	// 第 4 步：构造 LedgerService + OutboxPublisher + Reconciler。
+	publisher := outbox.NewPostgresPublisher()
+	ledgerSvc := ledger.NewPostgresService(pool, publisher, logger)
+	reconciler := ledger.NewReconciler(ledgerSvc, pool, ledger.ReconcilerConfig{
+		Interval:     5 * time.Minute,
+		InitialDelay: 30 * time.Second,
+		ConfirmDelay: 1 * time.Second,
+		DriftAction:  cfg.LedgerDriftAction, // P0 默认 "log"；生产 1-2 周零误报后切 "freeze"
+		Log:          logger,
+		Metrics:      metrics,
+	})
+
+	// 第 5 步：装配 HTTP server + 注册 /readyz 的 postgres 探针。
 	srv := httpapi.NewServer(cfg, httpapi.Deps{
 		Logger:  logger,
 		Metrics: metrics,
 		Build:   httpapi.BuildInfo{Version: version, Commit: commit},
 	})
+	srv.AddReadinessCheck("postgres", func(ctx context.Context) error {
+		// /readyz handler 内部已加 2s 超时；这里直接 Ping 即可。
+		return pool.Ping(ctx)
+	})
 
-	// 第 4 步：信号驱动的优雅停机。
+	// 第 6 步：启动 ReconcilerController（goroutine + SIGUSR1 handler；Windows 是 no-op）。
+	// parentCtx 用 Background：由 controller.Stop 终止，不依赖外部 signal ctx。
+	reconCtrl := ledger.NewReconcilerController(context.Background(), reconciler, logger, metrics)
+	reconCtrl.Start()
+
+	// 第 7 步：信号驱动的优雅停机。
 	serverErr := make(chan error, 1)
 	go func() {
 		if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -96,6 +159,7 @@ func run() error {
 	}()
 
 	sigCh := make(chan os.Signal, 1)
+	// SIGUSR1 不在此处监听：由 ReconcilerController（Unix 平台）单独注册。
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
@@ -103,18 +167,61 @@ func run() error {
 		logger.Info("收到信号，开始优雅停机", slog.String("signal", sig.String()))
 	case err := <-serverErr:
 		if err != nil {
+			// HTTP server 异常退出：仍按顺序 cleanup reconciler / pool 再返回。
+			logger.Error("HTTP server 异常退出，触发 cleanup",
+				slog.String("err", err.Error()))
+			reconCtrl.Stop()
 			return fmt.Errorf("HTTP server 异常退出: %w", err)
 		}
-		return nil
+		// serverErr 关闭但无 error → 正常 Shutdown 路径走过；继续 cleanup。
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// graceful shutdown 顺序（计划 Unit 10）：
+	//  1. HTTP server.Shutdown（拒新连接 + 等存活请求完成，最长 30s）
+	//  2. ReconcilerController.Stop（cancel goroutine + cleanup signal handler）
+	//  3. pool.Close（defer，函数末尾执行）
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server 停机异常", slog.String("err", err.Error()))
 		// Shutdown 内部已调用 Close 兜底，这里只记录不再返回错误。
 	}
 
+	reconCtrl.Stop()
+
 	logger.Info("api-gateway 已退出")
 	return nil
+}
+
+// newPGXPool 构造 pgxpool 并 Ping fail-fast。
+//
+// 失败语义：
+//   - DSN 解析失败 → wrap error 返回（不可达，启动失败）
+//   - pgxpool.NewWithConfig 失败 → wrap error 返回
+//   - Ping 失败 → 先 Close pool 再返回 error（让 main fail-fast 退出）
+func newPGXPool(dsn string) (*pgxpool.Pool, error) {
+	if dsn == "" {
+		return nil, errors.New("PGDSN 为空（config 校验本该拦住，请检查）")
+	}
+	pcfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("pgxpool.ParseConfig: %w", err)
+	}
+	pcfg.MaxConns = dbMaxConns
+	pcfg.MinConns = dbMinConns
+	pcfg.MaxConnLifetime = dbMaxConnLifetime
+	pcfg.MaxConnIdleTime = dbMaxConnIdleTime
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbPingTimeout)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		return nil, fmt.Errorf("pgxpool.NewWithConfig: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pool.Ping（DB 不可达）: %w", err)
+	}
+	return pool, nil
 }

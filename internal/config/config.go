@@ -33,6 +33,7 @@ const (
 	keyAdminTokenSigningKey = "admin_token_signing_key"
 	keyOTelExporter         = "otel_exporter"
 	keyCORSAllowedOrigins   = "cors_allowed_origins"
+	keyLedgerDriftAction    = "ledger_drift_action"
 )
 
 // Config 是整个 api-gateway 进程的配置快照。
@@ -55,6 +56,12 @@ type Config struct {
 	// CORSAllowedOrigins CORS 允许的 origin 白名单。空切片 = 拒绝所有跨域（fail-closed）。
 	// 环境变量来源：CORS_ALLOWED_ORIGINS（逗号分隔，例 "https://a.com,https://b.com"）。
 	CORSAllowedOrigins []string
+	// LedgerDriftAction reconciler 发现 drift 后的处理动作（计划 Unit 7）。
+	// 取值：
+	//   - "log"    P0 默认；dry-run 模式，仅 log + bump metric，不冻结账户
+	//   - "freeze" 二次确认仍不一致即调 service.Freeze，账户进入 frozen 状态
+	// 生产环境建议先跑 1-2 周 dry-run 零误报后再切 "freeze"。
+	LedgerDriftAction string
 }
 
 // Load 加载并校验配置。
@@ -71,6 +78,7 @@ func Load(envFilePath string) (*Config, error) {
 		keyRedisAddr:          "localhost:6379",
 		keyOTelExporter:       "stdout",
 		keyCORSAllowedOrigins: "",
+		keyLedgerDriftAction:  "log",
 	}
 	if err := k.Load(mapProvider(defaults), nil); err != nil {
 		return nil, fmt.Errorf("加载默认值失败: %w", err)
@@ -116,6 +124,7 @@ func Load(envFilePath string) (*Config, error) {
 		AdminTokenSigningKey: k.String(keyAdminTokenSigningKey),
 		OTelExporter:         k.String(keyOTelExporter),
 		CORSAllowedOrigins:   parseOrigins(k.String(keyCORSAllowedOrigins)),
+		LedgerDriftAction:    k.String(keyLedgerDriftAction),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -156,6 +165,14 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("配置项 LOG_LEVEL 非法值 %q，仅支持 debug|info|warn|error",
 			c.LogLevel)
+	}
+
+	switch c.LedgerDriftAction {
+	case "log", "freeze":
+		// ok
+	default:
+		return fmt.Errorf("配置项 LEDGER_DRIFT_ACTION 非法值 %q，仅支持 log|freeze",
+			c.LedgerDriftAction)
 	}
 
 	return nil
