@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	"github.com/sunxin-git/api-gateway/internal/httpapi/middleware"
 )
 
 // NewLogger 按指定等级创建 slog JSON handler，输出到 stderr。
@@ -22,10 +24,15 @@ func NewLogger(level string) (*slog.Logger, error) {
 }
 
 // newLoggerWithWriter 内部入口，便于测试时注入 buffer。
+//
+// 全局 slog handler 装载 sensitive-header redactor（Phase 2 工作流 D-min Unit 4 决策）：
+// 任何 attr 的 key 命中 (?i)authorization|token|key|secret|cookie → 值替换为 [REDACTED]。
+// 即便当前 access log 不打 header，未来扩展 / handler 误用时本钩子兜底防泄漏。
 func newLoggerWithWriter(w io.Writer, lvl slog.Level) *slog.Logger {
 	h := slog.NewJSONHandler(w, &slog.HandlerOptions{
-		Level:     lvl,
-		AddSource: false, // 性能优先，必要时按需打开
+		Level:       lvl,
+		AddSource:   false, // 性能优先，必要时按需打开
+		ReplaceAttr: middleware.RedactSensitiveAttrs(),
 	})
 	return slog.New(h)
 }
