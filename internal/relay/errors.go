@@ -5,8 +5,6 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-
-	"github.com/sunxin-git/api-gateway/internal/httpapi/middleware"
 )
 
 // Sentinel errors —— 包对外契约。
@@ -60,9 +58,13 @@ type ErrorResponse struct {
 // WriteErrorJSON 写 OpenAI 兼容错误响应 + 中止后续 middleware / handler 执行。
 //
 // 入参：
-//   - c：gin context（取 request_id 用 middleware.GetRequestID）
+//   - c：gin context（用 AbortWithStatusJSON 写响应）
 //   - status：HTTP status code（plan §决策 D9 完整映射表）
 //   - errType / code / message：直接填 ErrorBody 字段
+//
+// 设计选择：request_id 通过 gin context "request_id" key 读（middleware.RequestID
+// 中间件设置；不直接 import middleware 避免循环依赖 —— relay 包反过来被 middleware
+// 包导入用于错误响应）。
 //
 // 副作用：c.AbortWithStatusJSON → 后续 middleware / handler 被跳过；
 // audit middleware（defer 模式）仍 emit record 含 status。
@@ -72,9 +74,25 @@ func WriteErrorJSON(c *gin.Context, status int, errType, code, message string) {
 			Type:      errType,
 			Code:      code,
 			Message:   message,
-			RequestID: middleware.GetRequestID(c),
+			RequestID: getRequestIDFromCtx(c),
 		},
 	})
+}
+
+// getRequestIDFromCtx 从 gin.Context 读 request_id。
+//
+// 与 middleware.GetRequestID 同 key（"request_id"）；硬编码常量避免反向 import middleware。
+// 不存在时返空串（错误响应仍合法）。
+func getRequestIDFromCtx(c *gin.Context) string {
+	v, ok := c.Get("request_id")
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
 }
 
 // =============================================================================

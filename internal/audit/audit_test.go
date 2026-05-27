@@ -159,8 +159,8 @@ func TestAsyncStderrSink_WritesJSONWithAttrs(t *testing.T) {
 	}
 	require.NoError(t, sink.Emit(context.Background(), rec))
 	out := buf.String()
-	// slog.JSONHandler 自带 time / level / msg 三个外层字段
-	assert.Contains(t, out, "\"msg\":\"admin_audit\"")
+	// 直接 json.Marshal(record)，不再有 slog 框架外层 time/level/msg
+	assert.Contains(t, out, "\"event\":\"admin_audit\"")
 	assert.Contains(t, out, "\"request_id\":\"r2\"")
 	assert.Contains(t, out, "\"tier\":2")
 	assert.Contains(t, out, "\"path\":\"/admin/v1/x\"")

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"sync"
 )
@@ -15,7 +14,7 @@ import (
 //
 // 实现：
 //   - SyncFileSink：高价值同步落盘（O_APPEND + O_SYNC，每写 fsync）
-//   - AsyncStderrSink：低价值异步 stderr（基于 slog.JSONHandler，无 fsync）
+//   - AsyncStderrSink：低价值异步 stderr（json.Marshal JSON Lines，无 fsync）
 //
 // Emit 应在调用线程内同步返回；async 行为由 sink 内部实现（如 SyncFileSink 是真同步，
 // AsyncStderrSink 是 stderr 写后立即返回，依赖 OS 缓冲）。
@@ -99,21 +98,28 @@ func (s *SyncFileSink) Close() error {
 }
 
 // =============================================================================
-// AsyncStderrSink — Tier2 异步 stderr（slog.JSONHandler）
+// AsyncStderrSink — Tier2 异步 stderr（json.Marshal JSON Lines）
 // =============================================================================
 
-// AsyncStderrSink 把 audit 行作为 slog Info 事件写到 stderr。
+// AsyncStderrSink 把 audit 行作为 JSON Lines 写到 stderr。
 //
-// 设计动机：低价值事件（recharge / balance read）量大；走 stderr 由部署侧 log shipper 转走。
-// 同步 stderr 写本身非 OS 阻塞（依赖管道缓冲）；"异步"理解为"无 fsync"而非真后台 goroutine。
+// 设计动机：低价值事件量大；走 stderr 由部署侧 log shipper 转走。
+// "异步"理解为"无 fsync"而非真后台 goroutine（每写直接 stderr，OS 缓冲）。
 //
-// 强制 JSONHandler（构造时拒绝 TextHandler 注入）：审计字段含 user-controlled 字符串
-// （external_ref / account_id / reference_id），text handler 攻击者可注入伪造日志行。
+// 与 SyncFileSink 同样使用 json.Marshal(record) 输出纯净 JSON Lines：
+// admin/business 通过 AuditRecord omitempty 字段区分；log shipper ingest 时按
+// event 字段路由（"admin_audit" / "business_relay"）。
+//
+// 安全：json.Marshal 自动转义 \n / \r / \" 等控制字符；user-controlled 字符串
+// （external_ref / account_id）不会注入伪造日志行（验证：F-min Unit 4 测试）。
+//
+// 并发：sync.Mutex 串行化写；防多 goroutine 交错半行。
 type AsyncStderrSink struct {
-	logger *slog.Logger
+	w  io.Writer
+	mu sync.Mutex
 }
 
-// NewAsyncStderrSink 构造 stderr sink；内部强制 slog.JSONHandler（防 text handler 注入）。
+// NewAsyncStderrSink 构造 stderr sink。
 //
 // 出参：可直接复用一个共享 *AsyncStderrSink 实例。
 func NewAsyncStderrSink() *AsyncStderrSink {
@@ -122,32 +128,24 @@ func NewAsyncStderrSink() *AsyncStderrSink {
 
 // newAsyncSinkTo 测试入口；允许注入任意 io.Writer 验证输出。
 func newAsyncSinkTo(w io.Writer) *AsyncStderrSink {
-	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo})
-	return &AsyncStderrSink{logger: slog.New(h)}
+	return &AsyncStderrSink{w: w}
 }
 
-// Emit 把 AuditRecord 转换为 slog attrs 并 Info 输出。
+// Emit 把 AuditRecord 序列化为 JSON Lines 写入底层 writer。
 //
-// slog.JSONHandler 自动加 time / level / msg 三个外层字段；audit 字段作为 attrs 嵌入。
-// 这与 SyncFileSink 的纯净 JSON 行格式不同：log shipper 在 ingest 时需识别两种结构。
-func (s *AsyncStderrSink) Emit(ctx context.Context, record AuditRecord) error {
-	s.logger.LogAttrs(ctx, slog.LevelInfo, "admin_audit",
-		slog.Int("tier", int(record.Tier)),
-		slog.String("request_id", record.RequestID),
-		slog.Time("timestamp_utc", record.TimestampUTC),
-		slog.Int64("token_id", record.TokenID),
-		slog.String("token_description", record.TokenDescription),
-		slog.String("actor", record.Actor),
-		slog.String("source_ip", record.SourceIP),
-		slog.String("method", record.Method),
-		slog.String("path", record.Path),
-		slog.String("request_hash", record.RequestHash),
-		slog.Int64("body_size_bytes", record.BodySizeBytes),
-		slog.Int("status", record.Status),
-		slog.Int64("duration_ms", record.DurationMs),
-		slog.String("outcome_code", record.OutcomeCode),
-		slog.String("reason", record.Reason),
-	)
+// admin/business 字段通过 omitempty 自动按需呈现；不输出 slog 框架的 time/level/msg
+// 外层包装（AuditRecord.TimestampUTC + Tier 已等价）。
+func (s *AsyncStderrSink) Emit(_ context.Context, record AuditRecord) error {
+	line, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	line = append(line, '\n')
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.w.Write(line); err != nil {
+		return err
+	}
 	return nil
 }
 
