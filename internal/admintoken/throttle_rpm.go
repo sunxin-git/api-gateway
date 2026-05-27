@@ -23,12 +23,12 @@ type InProcessRPM struct {
 
 	now func() time.Time // 注入式时钟，便于测试控制时间
 
-	gcInterval     time.Duration
-	idleThreshold  time.Duration // last_seen < now - idleThreshold → GC
-	gcStopCh       chan struct{}
-	gcDoneCh       chan struct{}
-	onColdStart    func()       // 启动 hook（如 bump cold-start metric）；可 nil
-	log            *slog.Logger
+	gcInterval    time.Duration
+	idleThreshold time.Duration // last_seen < now - idleThreshold → GC
+	gcStopCh      chan struct{}
+	gcDoneCh      chan struct{}
+	onColdStart   func() // 启动 hook（如 bump cold-start metric）；可 nil
+	log           *slog.Logger
 }
 
 // tokenRPMState 单 token 的 RPM 状态。
@@ -105,7 +105,11 @@ func (r *InProcessRPM) Check(token *Token) error {
 	}
 
 	v, _ := r.states.LoadOrStore(token.ID, &tokenRPMState{})
-	st := v.(*tokenRPMState)
+	st, ok := v.(*tokenRPMState)
+	if !ok {
+		// 防御性：sync.Map 中类型异常不应发生
+		return nil
+	}
 
 	now := r.now().UnixNano()
 	cutoff := now - int64(time.Minute)
@@ -130,9 +134,9 @@ func (r *InProcessRPM) Check(token *Token) error {
 	// 防御性 hard cap：避免恶意客户端导致 slice 无限增长（理论上 limit 限制了，但兜底）
 	if cap(st.timestamps) > 4*limit && len(st.timestamps) < limit/2 {
 		// slice 容量远大于当前内容时主动收缩
-		newTs := make([]int64, len(st.timestamps), limit)
-		copy(newTs, st.timestamps)
-		st.timestamps = newTs
+		newTS := make([]int64, len(st.timestamps), limit)
+		copy(newTS, st.timestamps)
+		st.timestamps = newTS
 	}
 
 	st.timestamps = append(st.timestamps, now)
@@ -165,7 +169,10 @@ func (r *InProcessRPM) gcOnce() {
 
 	var removed int
 	r.states.Range(func(key, value any) bool {
-		st := value.(*tokenRPMState)
+		st, ok := value.(*tokenRPMState)
+		if !ok {
+			return true
+		}
 		st.mu.Lock()
 		idle := st.lastSeen < cutoff
 		st.mu.Unlock()
@@ -186,7 +193,10 @@ func (r *InProcessRPM) peekCount(tokenID int64) int {
 	if !ok {
 		return 0
 	}
-	st := v.(*tokenRPMState)
+	st, ok := v.(*tokenRPMState)
+	if !ok {
+		return 0
+	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return len(st.timestamps)

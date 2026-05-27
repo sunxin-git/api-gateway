@@ -279,14 +279,14 @@ func runTokenList(cmd *cobra.Command) error {
 	refundIDs := make([]int64, 0)
 	for _, t := range tokens {
 		items = append(items, tokenListItem{
-			ID:                t.ID,
-			Description:       t.Description,
-			Scopes:            t.Scopes,
-			IPAllowlistCount:  len(t.AllowedCIDRs),
-			ExpiresAt:         formatTimePtr(t.ExpiresAt),
-			RevokedAt:         formatTimePtr(t.RevokedAt),
-			CreatedBy:         t.CreatedBy,
-			CreatedAt:         t.CreatedAt.UTC().Format(time.RFC3339),
+			ID:                    t.ID,
+			Description:           t.Description,
+			Scopes:                t.Scopes,
+			IPAllowlistCount:      len(t.AllowedCIDRs),
+			ExpiresAt:             formatTimePtr(t.ExpiresAt),
+			RevokedAt:             formatTimePtr(t.RevokedAt),
+			CreatedBy:             t.CreatedBy,
+			CreatedAt:             t.CreatedAt.UTC().Format(time.RFC3339),
 			CircuitBreakerEnabled: t.CircuitBreakerEnabled,
 		})
 		if containsRefundScope(t.Scopes) {

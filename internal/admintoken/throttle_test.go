@@ -133,7 +133,7 @@ func TestRPM_BurstWithinSecond(t *testing.T) {
 	t.Cleanup(func() { _ = rpm.Close() })
 
 	// 模拟"500ms 内 200 次" burst：注入快速时钟
-	var nowNs int64 = time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC).UnixNano()
+	nowNs := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC).UnixNano()
 	rpm.now = func() time.Time { return time.Unix(0, atomic.LoadInt64(&nowNs)) }
 
 	limit := int32(50)
@@ -151,7 +151,7 @@ func TestRPM_BurstWithinSecond(t *testing.T) {
 func TestRPM_GCRemovesIdleTokens(t *testing.T) {
 	rpm := newTestRPM()
 	t.Cleanup(func() { _ = rpm.Close() })
-	var nowNs int64 = time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC).UnixNano()
+	nowNs := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC).UnixNano()
 	rpm.now = func() time.Time { return time.Unix(0, atomic.LoadInt64(&nowNs)) }
 	rpm.idleThreshold = time.Minute
 

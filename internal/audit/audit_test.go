@@ -268,4 +268,3 @@ func TestLogger_CloseClosesBothSinks(t *testing.T) {
 	// 二次 Close（通过底层 sink 直接调）应幂等
 	require.NoError(t, t1.Close())
 }
-

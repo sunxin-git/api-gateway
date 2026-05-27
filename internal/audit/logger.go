@@ -77,11 +77,11 @@ func (l *Logger) Emit(ctx context.Context, record AuditRecord) error {
 	}
 }
 
-// Close 关闭两个 sink；返回首个非 nil 错误。
+// Close 关闭两个 sink；返回首个非 nil 错误（Tier1 优先）。
 func (l *Logger) Close() error {
 	var firstErr error
 	if l.tier1 != nil {
-		if err := l.tier1.Close(); err != nil && firstErr == nil {
+		if err := l.tier1.Close(); err != nil {
 			firstErr = err
 		}
 	}

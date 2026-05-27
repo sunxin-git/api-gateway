@@ -88,26 +88,6 @@ func setupSuite(t *testing.T) (*pgxpool.Pool, *PostgresService) {
 	return pool, svc
 }
 
-// cleanupTokens 删除 id 列表对应的 token；usage / circuit 表通过 FK CASCADE 一并清。
-//
-// 测试代码模式：
-//
-//	tok, _, err := svc.Create(ctx, params)
-//	cleanupTokens(t, pool, tok.ID)
-func cleanupTokens(t *testing.T, pool *pgxpool.Pool, tokenIDs ...int64) {
-	t.Helper()
-	if len(tokenIDs) == 0 {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for _, id := range tokenIDs {
-		if _, err := pool.Exec(ctx, "DELETE FROM gateway_admin_token WHERE id = $1", id); err != nil {
-			t.Fatalf("DELETE gateway_admin_token id=%d: %v", id, err)
-		}
-	}
-}
-
 // cleanupTokensByDescription 按 description 前缀清理（用于按测试名隔离）。
 //
 // FK CASCADE 会一并清 usage / circuit。

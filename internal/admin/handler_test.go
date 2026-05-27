@@ -95,14 +95,13 @@ func (o *testOutbox) PublishInTx(ctx context.Context, tx pgx.Tx, event ledger.Ev
 
 // testSuite 提供 handler + 依赖 + helper。
 type testSuite struct {
-	pool       *pgxpool.Pool
-	ledgerSvc  *ledger.PostgresService
-	tokenSvc   *admintoken.PostgresService
-	rpm        *admintoken.InProcessRPM
-	throttle   *admintoken.PostgresThrottle
-	handler    *Handler
-	auditMu    sync.Mutex
-	auditSink  *recordingAudit
+	pool      *pgxpool.Pool
+	ledgerSvc *ledger.PostgresService
+	tokenSvc  *admintoken.PostgresService
+	rpm       *admintoken.InProcessRPM
+	throttle  *admintoken.PostgresThrottle
+	handler   *Handler
+	auditSink *recordingAudit
 }
 
 type recordingAudit struct {
@@ -437,8 +436,8 @@ func TestRecharge_IdempotencyConflict_409(t *testing.T) {
 
 func TestRecharge_SingleRechargeMax_429(t *testing.T) {
 	s := setupSuite(t)
-	max := int64(500)
-	tok := s.createToken(t, func(p *admintoken.CreateParams) { p.SingleRechargeMax = &max })
+	maxAmt := int64(500)
+	tok := s.createToken(t, func(p *admintoken.CreateParams) { p.SingleRechargeMax = &maxAmt })
 	r := s.buildEngine(t, tok)
 	accID := "biz-rec-cap"
 	s.cleanupAccount(t, accID)
@@ -530,7 +529,6 @@ func TestRecharge_ConcurrentSameToken_DailyCounterNoLoss(t *testing.T) {
 	var wgC sync.WaitGroup
 	wgC.Add(N)
 	for i := 0; i < N; i++ {
-		i := i
 		go func() {
 			defer wgC.Done()
 			w := doRequest(r, http.MethodPost, "/admin/v1/business-accounts", map[string]any{"id": accIDs[i]})
@@ -544,7 +542,6 @@ func TestRecharge_ConcurrentSameToken_DailyCounterNoLoss(t *testing.T) {
 	wg.Add(N)
 	failures := make(chan string, N)
 	for i := 0; i < N; i++ {
-		i := i
 		go func() {
 			defer wg.Done()
 			w := doRequest(r, http.MethodPost, "/admin/v1/business-accounts/"+accIDs[i]+"/recharge",
@@ -922,8 +919,8 @@ func TestRefund_DailyRefundQuota_429(t *testing.T) {
 
 func TestRefund_SingleRefundMax_429(t *testing.T) {
 	s := setupSuite(t)
-	max := int64(50)
-	tok := s.createToken(t, func(p *admintoken.CreateParams) { p.SingleRefundMax = &max })
+	maxAmt := int64(50)
+	tok := s.createToken(t, func(p *admintoken.CreateParams) { p.SingleRefundMax = &maxAmt })
 	r := s.buildEngine(t, tok)
 	accID := "biz-refund-singlec"
 	s.cleanupAccount(t, accID)
