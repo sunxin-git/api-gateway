@@ -10,10 +10,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sunxin-git/api-gateway/internal/db"
+)
+
+// PostgreSQL SQLSTATE 常量（pgx 不自带常量集，自行声明以提高可读性）。
+const (
+	pgSQLStateUniqueViolation = "23505"
 )
 
 // 财务事件 outbox 保留期（1 年）；非财务事件 5 分钟。
@@ -88,6 +94,12 @@ func (s *PostgresService) CreateAccount(ctx context.Context, actor Actor, params
 		Metadata:          meta,
 	})
 	if err != nil {
+		// 检测 UNIQUE 冲突（SQLSTATE 23505 + pk_business_account 约束）→ 显式 sentinel。
+		// 决策 D12（D-min document-review）：让 handler 能用 errors.Is 匹配为 409。
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.SQLState() == pgSQLStateUniqueViolation && pgErr.ConstraintName == "pk_business_account" {
+			return nil, ErrAccountAlreadyExists
+		}
 		return nil, fmt.Errorf("CreateBusinessAccount 失败: %w", err)
 	}
 	if _, err := q.CreateBusinessAccountBalanceZero(ctx, params.ID); err != nil {
@@ -123,15 +135,15 @@ func (s *PostgresService) CreateAccount(ctx context.Context, actor Actor, params
 // Recharge
 // =============================================================================
 
-func (s *PostgresService) Recharge(ctx context.Context, actor Actor, params RechargeParams) (*LedgerEntry, error) {
+func (s *PostgresService) Recharge(ctx context.Context, actor Actor, params RechargeParams) (*LedgerEntry, WriteOutcome, error) {
 	if err := actor.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid actor: %w", err)
+		return nil, 0, fmt.Errorf("invalid actor: %w", err)
 	}
 	if params.Amount <= 0 {
-		return nil, ErrInvalidAmount
+		return nil, 0, ErrInvalidAmount
 	}
 	if params.AccountID == "" {
-		return nil, errors.New("RechargeParams.AccountID 不能为空")
+		return nil, 0, errors.New("RechargeParams.AccountID 不能为空")
 	}
 
 	// 计算 canonical body sha256（用作幂等冲突时的内容一致性校验）。
@@ -139,14 +151,14 @@ func (s *PostgresService) Recharge(ctx context.Context, actor Actor, params Rech
 	if params.CanonicalBody != nil {
 		h, err := canonicalizeBody(params.CanonicalBody)
 		if err != nil {
-			return nil, fmt.Errorf("canonicalizeBody 失败: %w", err)
+			return nil, 0, fmt.Errorf("canonicalizeBody 失败: %w", err)
 		}
 		bodyHash = h
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return nil, fmt.Errorf("BeginTx 失败: %w", err)
+		return nil, 0, fmt.Errorf("BeginTx 失败: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -167,14 +179,14 @@ func (s *PostgresService) Recharge(ctx context.Context, actor Actor, params Rech
 					slog.String("idempotency_key", params.IdempotencyKey),
 					slog.Int64("existing_ledger_id", existing.ID),
 					slog.String("actor", actor.String()))
-				return nil, ErrIdempotencyConflict
+				return nil, 0, ErrIdempotencyConflict
 			}
-			// body 一致：幂等成功返原 entry
-			return idempotencyRowToEntry(existing), nil
+			// body 一致：幂等成功返原 entry（IdempotentReplay，调用方不应累加配额）
+			return idempotencyRowToEntry(existing), WriteOutcomeIdempotentReplay, nil
 		case errors.Is(err, pgx.ErrNoRows):
 			// 未命中，继续走 CTE
 		default:
-			return nil, fmt.Errorf("FindLedgerEntryByIdempotencyKey 失败: %w", err)
+			return nil, 0, fmt.Errorf("FindLedgerEntryByIdempotencyKey 失败: %w", err)
 		}
 	}
 
@@ -182,9 +194,9 @@ func (s *PostgresService) Recharge(ctx context.Context, actor Actor, params Rech
 	bal, err := q.GetBalanceInTx(ctx, params.AccountID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrAccountNotFound
+			return nil, 0, ErrAccountNotFound
 		}
-		return nil, fmt.Errorf("GetBalanceInTx 失败: %w", err)
+		return nil, 0, fmt.Errorf("GetBalanceInTx 失败: %w", err)
 	}
 
 	// CTE 单语句原子写。
@@ -212,9 +224,9 @@ func (s *PostgresService) Recharge(ctx context.Context, actor Actor, params Rech
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// CAS 失败：同 tx 内 fresh-read 判错（frozen / version）。
-			return nil, s.classifyRechargeError(ctx, q, params.AccountID, bal.Version)
+			return nil, 0, s.classifyRechargeError(ctx, q, params.AccountID, bal.Version)
 		}
-		return nil, fmt.Errorf("RechargeAtomic 失败: %w", err)
+		return nil, 0, fmt.Errorf("RechargeAtomic 失败: %w", err)
 	}
 
 	// outbox event。
@@ -237,11 +249,11 @@ func (s *PostgresService) Recharge(ctx context.Context, actor Actor, params Rech
 			EventTypeAccountRecharged, params.AccountID, res.NewLedgerID),
 	}
 	if err := s.outbox.PublishInTx(ctx, tx, evt); err != nil {
-		return nil, fmt.Errorf("outbox.Publish 失败: %w", err)
+		return nil, 0, fmt.Errorf("outbox.Publish 失败: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("Commit 失败: %w", err)
+		return nil, 0, fmt.Errorf("Commit 失败: %w", err)
 	}
 
 	return &LedgerEntry{
@@ -261,7 +273,7 @@ func (s *PostgresService) Recharge(ctx context.Context, actor Actor, params Rech
 		ActorType:         string(actor.Type),
 		ActorID:           actor.ID,
 		CreatedAt:         res.NewCreatedAt,
-	}, nil
+	}, WriteOutcomeFreshlyWritten, nil
 }
 
 // =============================================================================
@@ -635,20 +647,20 @@ func (s *PostgresService) Release(ctx context.Context, actor Actor, params Relea
 // Refund
 // =============================================================================
 
-func (s *PostgresService) Refund(ctx context.Context, actor Actor, params RefundParams) (*LedgerEntry, error) {
+func (s *PostgresService) Refund(ctx context.Context, actor Actor, params RefundParams) (*LedgerEntry, WriteOutcome, error) {
 	if err := actor.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid actor: %w", err)
+		return nil, 0, fmt.Errorf("invalid actor: %w", err)
 	}
 	if params.Amount <= 0 {
-		return nil, ErrInvalidAmount
+		return nil, 0, ErrInvalidAmount
 	}
 	if params.AccountID == "" || params.CorrelationID == "" {
-		return nil, errors.New("RefundParams.AccountID/CorrelationID 不能为空")
+		return nil, 0, errors.New("RefundParams.AccountID/CorrelationID 不能为空")
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return nil, fmt.Errorf("BeginTx 失败: %w", err)
+		return nil, 0, fmt.Errorf("BeginTx 失败: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -660,17 +672,18 @@ func (s *PostgresService) Refund(ctx context.Context, actor Actor, params Refund
 		CorrelationID:     params.CorrelationID,
 		EntryType:         db.LedgerEntryTypeRefund,
 	}); err == nil {
-		return correlationRowToEntry(existing), nil
+		// 幂等命中：返原 entry + IdempotentReplay outcome（调用方不累加 refund 配额）
+		return correlationRowToEntry(existing), WriteOutcomeIdempotentReplay, nil
 	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("FindLedgerEntryByCorrelationAndType 失败: %w", err)
+		return nil, 0, fmt.Errorf("FindLedgerEntryByCorrelationAndType 失败: %w", err)
 	}
 
 	bal, err := q.GetBalanceInTx(ctx, params.AccountID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrAccountNotFound
+			return nil, 0, ErrAccountNotFound
 		}
-		return nil, fmt.Errorf("GetBalanceInTx 失败: %w", err)
+		return nil, 0, fmt.Errorf("GetBalanceInTx 失败: %w", err)
 	}
 
 	res, err := q.RefundAtomic(ctx, db.RefundAtomicParams{
@@ -687,9 +700,9 @@ func (s *PostgresService) Refund(ctx context.Context, actor Actor, params Refund
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, s.classifyRefundError(ctx, q, params.AccountID, bal.Version, params.Amount)
+			return nil, 0, s.classifyRefundError(ctx, q, params.AccountID, bal.Version, params.Amount)
 		}
-		return nil, fmt.Errorf("RefundAtomic 失败: %w", err)
+		return nil, 0, fmt.Errorf("RefundAtomic 失败: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -713,11 +726,11 @@ func (s *PostgresService) Refund(ctx context.Context, actor Actor, params Refund
 		DeliveryIdempotencyKey: fmt.Sprintf("%s:%s:%d", EventTypeAccountRefunded, params.AccountID, res.NewLedgerID),
 	}
 	if err := s.outbox.PublishInTx(ctx, tx, evt); err != nil {
-		return nil, fmt.Errorf("outbox.Publish 失败: %w", err)
+		return nil, 0, fmt.Errorf("outbox.Publish 失败: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("Commit 失败: %w", err)
+		return nil, 0, fmt.Errorf("Commit 失败: %w", err)
 	}
 
 	return &LedgerEntry{
@@ -736,7 +749,7 @@ func (s *PostgresService) Refund(ctx context.Context, actor Actor, params Refund
 		ActorType:         string(actor.Type),
 		ActorID:           actor.ID,
 		CreatedAt:         res.NewCreatedAt,
-	}, nil
+	}, WriteOutcomeFreshlyWritten, nil
 }
 
 // =============================================================================

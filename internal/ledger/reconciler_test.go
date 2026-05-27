@@ -503,7 +503,7 @@ func TestReconciler_Concurrent_RechargeNoFalsePositive(t *testing.T) {
 		defer close(done)
 		actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
 		for i := 0; i < 5; i++ {
-			_, err := h.svc.Recharge(ctx, actor, RechargeParams{
+			_, _, err := h.svc.Recharge(ctx, actor, RechargeParams{
 				AccountID:      accountID,
 				Amount:         100,
 				IdempotencyKey: "conc-" + uniqueSuffixN(i),

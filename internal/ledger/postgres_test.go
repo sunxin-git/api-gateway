@@ -61,7 +61,7 @@ func newAccountWithBalance(t *testing.T, svc *PostgresService, accountID string,
 	_, err := svc.CreateAccount(ctx, actor, CreateAccountParams{ID: accountID})
 	require.NoError(t, err, "CreateAccount")
 	if recharge > 0 {
-		_, err := svc.Recharge(ctx, actor, RechargeParams{
+		_, _, err := svc.Recharge(ctx, actor, RechargeParams{
 			AccountID:      accountID,
 			Amount:         recharge,
 			IdempotencyKey: accountID + ":init",
@@ -127,7 +127,7 @@ func TestRecharge_Happy(t *testing.T) {
 	actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
 	newAccountWithBalance(t, svc, "biz-rec-1", 0)
 
-	entry, err := svc.Recharge(ctx, actor, RechargeParams{
+	entry, _, err := svc.Recharge(ctx, actor, RechargeParams{
 		AccountID:      "biz-rec-1",
 		Amount:         1000,
 		IdempotencyKey: "k1",
@@ -152,11 +152,11 @@ func TestRecharge_IdempotencySuccess(t *testing.T) {
 	newAccountWithBalance(t, svc, "biz-idem", 0)
 
 	body := &RechargeBody{AccountID: "biz-idem", Amount: 500}
-	e1, err := svc.Recharge(ctx, actor, RechargeParams{
+	e1, _, err := svc.Recharge(ctx, actor, RechargeParams{
 		AccountID: "biz-idem", Amount: 500, IdempotencyKey: "ik-1", CanonicalBody: body,
 	})
 	require.NoError(t, err)
-	e2, err := svc.Recharge(ctx, actor, RechargeParams{
+	e2, _, err := svc.Recharge(ctx, actor, RechargeParams{
 		AccountID: "biz-idem", Amount: 500, IdempotencyKey: "ik-1", CanonicalBody: body,
 	})
 	require.NoError(t, err)
@@ -172,12 +172,12 @@ func TestRecharge_IdempotencyConflict(t *testing.T) {
 	actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
 	newAccountWithBalance(t, svc, "biz-conflict", 0)
 
-	_, err := svc.Recharge(ctx, actor, RechargeParams{
+	_, _, err := svc.Recharge(ctx, actor, RechargeParams{
 		AccountID: "biz-conflict", Amount: 100, IdempotencyKey: "ik-c",
 		CanonicalBody: &RechargeBody{AccountID: "biz-conflict", Amount: 100},
 	})
 	require.NoError(t, err)
-	_, err = svc.Recharge(ctx, actor, RechargeParams{
+	_, _, err = svc.Recharge(ctx, actor, RechargeParams{
 		AccountID: "biz-conflict", Amount: 200, IdempotencyKey: "ik-c", // 不同 amount → body 不同
 		CanonicalBody: &RechargeBody{AccountID: "biz-conflict", Amount: 200},
 	})
@@ -189,7 +189,7 @@ func TestRecharge_InvalidAmount(t *testing.T) {
 	ctx := ctxT(t)
 	actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
 	for _, amt := range []int64{0, -1, -100} {
-		_, err := svc.Recharge(ctx, actor, RechargeParams{AccountID: "x", Amount: amt})
+		_, _, err := svc.Recharge(ctx, actor, RechargeParams{AccountID: "x", Amount: amt})
 		require.ErrorIs(t, err, ErrInvalidAmount, "amount=%d 应拒绝", amt)
 	}
 }
@@ -198,7 +198,7 @@ func TestRecharge_AccountNotFound(t *testing.T) {
 	_, svc := setupSuite(t)
 	ctx := ctxT(t)
 	actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
-	_, err := svc.Recharge(ctx, actor, RechargeParams{
+	_, _, err := svc.Recharge(ctx, actor, RechargeParams{
 		AccountID: "ghost", Amount: 100,
 	})
 	require.ErrorIs(t, err, ErrAccountNotFound)
@@ -402,7 +402,7 @@ func TestRefund_Happy(t *testing.T) {
 	require.NoError(t, err)
 
 	// 退款 100
-	_, err = svc.Refund(ctx, cliActor, RefundParams{
+	_, _, err = svc.Refund(ctx, cliActor, RefundParams{
 		AccountID: "biz-rf", Amount: 100, CorrelationID: "refund-1",
 		ReferenceType: "manual", ReferenceID: "support-ticket-1",
 	})
@@ -420,7 +420,7 @@ func TestRefund_InsufficientUsed(t *testing.T) {
 	ctx := ctxT(t)
 	cliActor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
 	newAccountWithBalance(t, svc, "biz-rf-ne", 1000)
-	_, err := svc.Refund(ctx, cliActor, RefundParams{
+	_, _, err := svc.Refund(ctx, cliActor, RefundParams{
 		AccountID: "biz-rf-ne", Amount: 100, CorrelationID: "c",
 	})
 	require.ErrorIs(t, err, ErrInsufficientUsed)
@@ -444,7 +444,7 @@ func TestFreezeUnfreeze_Lifecycle(t *testing.T) {
 	require.Equal(t, string(ReasonCodeDriftDetected), bal.FrozenReason)
 
 	// frozen 下 Recharge 拒绝
-	_, err := svc.Recharge(ctx, actor, RechargeParams{
+	_, _, err := svc.Recharge(ctx, actor, RechargeParams{
 		AccountID: "biz-fz", Amount: 100, IdempotencyKey: "x",
 		CanonicalBody: &RechargeBody{AccountID: "biz-fz", Amount: 100},
 	})
@@ -462,7 +462,7 @@ func TestFreezeUnfreeze_Lifecycle(t *testing.T) {
 	require.False(t, bal.Frozen)
 
 	// 解冻后 Recharge 成功
-	_, err = svc.Recharge(ctx, actor, RechargeParams{
+	_, _, err = svc.Recharge(ctx, actor, RechargeParams{
 		AccountID: "biz-fz", Amount: 100, IdempotencyKey: "y",
 		CanonicalBody: &RechargeBody{AccountID: "biz-fz", Amount: 100},
 	})
@@ -519,7 +519,7 @@ func TestFullLifecycle_RechargeReserveCommitRefund(t *testing.T) {
 	require.NoError(t, err)
 	assertInvariantDB(t, svc, acc)
 
-	_, err = svc.Recharge(ctx, cliActor, RechargeParams{
+	_, _, err = svc.Recharge(ctx, cliActor, RechargeParams{
 		AccountID: acc, Amount: 1000, IdempotencyKey: "topup-1",
 		CanonicalBody: &RechargeBody{AccountID: acc, Amount: 1000},
 	})
@@ -538,7 +538,7 @@ func TestFullLifecycle_RechargeReserveCommitRefund(t *testing.T) {
 	require.NoError(t, err)
 	assertInvariantDB(t, svc, acc)
 
-	_, err = svc.Refund(ctx, cliActor, RefundParams{
+	_, _, err = svc.Refund(ctx, cliActor, RefundParams{
 		AccountID: acc, Amount: 50, CorrelationID: "refund-A",
 	})
 	require.NoError(t, err)
@@ -577,7 +577,7 @@ func TestRefund_InvalidAmount(t *testing.T) {
 	_, svc := setupSuite(t)
 	ctx := ctxT(t)
 	actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
-	_, err := svc.Refund(ctx, actor, RefundParams{AccountID: "x", Amount: -1, CorrelationID: "c"})
+	_, _, err := svc.Refund(ctx, actor, RefundParams{AccountID: "x", Amount: -1, CorrelationID: "c"})
 	require.ErrorIs(t, err, ErrInvalidAmount)
 }
 
@@ -628,7 +628,7 @@ func TestRecharge_OutboxFailureRollsBackEverything(t *testing.T) {
 
 	// 注入 outbox 失败
 	outbox.failNext = true
-	_, err = svc.Recharge(ctx, cliActor, RechargeParams{
+	_, _, err = svc.Recharge(ctx, cliActor, RechargeParams{
 		AccountID: "biz-ob-fail", Amount: 100, IdempotencyKey: "k",
 		CanonicalBody: &RechargeBody{AccountID: "biz-ob-fail", Amount: 100},
 	})
@@ -656,9 +656,9 @@ func TestRechargeWithoutIdempotencyKey(t *testing.T) {
 	ctx := ctxT(t)
 	actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
 	newAccountWithBalance(t, svc, "biz-no-idem", 0)
-	_, err := svc.Recharge(ctx, actor, RechargeParams{AccountID: "biz-no-idem", Amount: 100})
+	_, _, err := svc.Recharge(ctx, actor, RechargeParams{AccountID: "biz-no-idem", Amount: 100})
 	require.NoError(t, err)
-	_, err = svc.Recharge(ctx, actor, RechargeParams{AccountID: "biz-no-idem", Amount: 100})
+	_, _, err = svc.Recharge(ctx, actor, RechargeParams{AccountID: "biz-no-idem", Amount: 100})
 	require.NoError(t, err, "无 idempotency_key 时允许重复充值")
 	bal, _ := svc.GetBalance(ctx, "biz-no-idem")
 	require.Equal(t, int64(200), bal.Available)

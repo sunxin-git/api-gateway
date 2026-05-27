@@ -218,7 +218,7 @@ func TestRebuild_AllEntryTypes(t *testing.T) {
 		AccountID: accountID, CorrelationID: "task-A", ActualCost: 250,
 	})
 	require.NoError(t, err)
-	_, err = svc.Refund(ctx, cliActor, RefundParams{
+	_, _, err = svc.Refund(ctx, cliActor, RefundParams{
 		AccountID: accountID, Amount: 100, CorrelationID: "refund-A",
 	})
 	require.NoError(t, err)
