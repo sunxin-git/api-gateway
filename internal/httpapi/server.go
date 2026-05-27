@@ -53,9 +53,22 @@ type Server struct {
 // 中间件链顺序（架构约束）：
 //
 //	recover → requestid → slog → otel → prom → cors
+//
+// Trusted proxies（Unit 7 fail-fast 决策）：
+//
+//	始终调 engine.SetTrustedProxies(cfg.TrustedProxyCIDRs)；空切片时 Gin 仅信任 RemoteAddr
+//	（fail-closed，不读 XFF）。production 模式下 config 校验已保证 ≥ 1 个 CIDR。
 func NewServer(cfg *config.Config, deps Deps) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
+
+	// 设置 trusted proxies：决定 c.ClientIP() 是否信任 X-Forwarded-For。
+	// 错误（如非法 CIDR）应该已在 config.validate 阶段拦截；这里仍记录但不让启动失败
+	// （网关进程已通过 config fail-fast，不应在此返 panic）。
+	if err := engine.SetTrustedProxies(cfg.TrustedProxyCIDRs); err != nil {
+		deps.Logger.Error("Gin SetTrustedProxies 失败（请检查 GATEWAY_TRUSTED_PROXIES 格式）",
+			slog.String("err", err.Error()))
+	}
 
 	engine.Use(
 		middleware.Recover(deps.Logger, deps.Metrics.PanicTotal),
@@ -100,6 +113,13 @@ func (s *Server) AddReadinessCheck(name string, check ReadinessCheck) {
 // 调用方通常在 goroutine 内调用并监听 ErrServerClosed。
 func (s *Server) Start() error {
 	return s.httpSrv.ListenAndServe()
+}
+
+// StartTLS 启动 TLS 监听（plan Unit 7 决策：GATEWAY_LISTEN_TLS=true 时入口）。
+//
+// cert/key 路径应已在 config.validate 阶段校验存在；本函数仅做最终启动。
+func (s *Server) StartTLS(certFile, keyFile string) error {
+	return s.httpSrv.ListenAndServeTLS(certFile, keyFile)
 }
 
 // Shutdown 优雅停机：等待 ctx 内的存活请求完成；超时则强制 Close。
