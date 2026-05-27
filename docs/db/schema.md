@@ -1,7 +1,7 @@
 # Schema 总览（当前生效版本）
 
-> **当前 migration 版本**：0002
-> **migration 文件**：`migrations/0001_init.{up,down}.sql` + `migrations/0002_ledger_fields_extension.{up,down}.sql`
+> **当前 migration 版本**：0003
+> **migration 文件**：`migrations/0001_init.{up,down}.sql` + `migrations/0002_ledger_fields_extension.{up,down}.sql` + `migrations/0003_admin_token_usage_and_circuit.{up,down}.sql`
 > **PG 版本要求**：≥ 15（项目宪法 CLAUDE.md 技术栈）
 > **本文档命名约定**：不带版本号，永远描述「当前生效 schema」；每次 migration 后增量加章节
 >
@@ -16,6 +16,7 @@
 |---|---|---|---|
 | 0001 | 2026-05-26 | 初始 9 张表 + 5 个枚举 + 账本不变量 CHECK + 非负 CHECK | [Phase 1 plan](../plans/2026-05-26-001-feat-phase-1-skeleton-and-migrations-plan.md) |
 | 0002 | 2026-05-26 | ledger 字段扩展（delta/reference/metadata/actor_type/actor_id/canonical_body_sha256）+ balance.last_ledger_id + 不可变 trigger（UPDATE/DELETE/TRUNCATE）+ entry-level CHECK + 复合 UNIQUE 索引（idempotency_key per entry_type、correlation_id per type）+ REVOKE 高危权限 + actor_type 枚举 | [Phase 2 工作流 E plan](../plans/2026-05-26-002-feat-workflow-e-ledger-infrastructure-plan.md) |
+| 0003 | 2026-05-27 | gateway_admin_token 增加 single_refund_max + daily_refund_quota_limit 两阀门 + token_hash COMMENT 修订为 HMAC-SHA-256 with pepper + 新表 gateway_admin_token_usage（每日用量累计）+ 新表 gateway_admin_token_circuit（熔断器状态） | [Phase 2 工作流 D-min plan](../plans/2026-05-27-003-feat-workflow-d-min-admin-api-plan.md) |
 
 ---
 
@@ -411,3 +412,69 @@
 ### 权限调整
 
 - `REVOKE TRUNCATE, DELETE, UPDATE ON business_account_ledger FROM PUBLIC` — 双兜底，即便单一 connection 用户也无法跑高危操作（P1 进一步做 DB role 分级）
+
+---
+
+## 0003 演化（2026-05-27）
+
+> 计划：[Phase 2 工作流 D-min plan](../plans/2026-05-27-003-feat-workflow-d-min-admin-api-plan.md) Unit 1
+
+### `gateway_admin_token` 新增字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `single_refund_max` | bigint NULL | 单笔退款金额上限（minor unit）；NULL = 无限制；document-review 添加（防 leaked refund-scope token 一次清空 used_total） |
+| `daily_refund_quota_limit` | bigint NULL | 当日累计退款金额上限（minor unit, UTC day）；NULL = 无限制 |
+
+### `gateway_admin_token` COMMENT 修订
+
+- **`token_hash`**：Phase 1 注释 "bcrypt / argon2id" 是笔误；本次修订为 **`HMAC-SHA-256(GATEWAY_TOKEN_PEPPER, token_plaintext) 的 hex 字符串（64 char）`**。决策依据见 [D-min plan §决策 D1](../plans/2026-05-27-003-feat-workflow-d-min-admin-api-plan.md)：随机 token + HMAC pepper 是业界标准（GitHub PAT / Stripe API Key），防 DB 全量泄露离线穷举。
+
+### 新表：`gateway_admin_token_usage`（每日累计用量）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `token_id` | bigint NOT NULL FK | 关联 gateway_admin_token.id；ON DELETE CASCADE |
+| `day` | date NOT NULL | UTC 当日（决策 D9：多时区业务系统对齐） |
+| `recharge_total_minor` | bigint NOT NULL DEFAULT 0 | 当日累计成功充值金额；仅 LedgerService outcome=FreshlyWritten 后累加 |
+| `refund_total_minor` | bigint NOT NULL DEFAULT 0 | 当日累计成功退款金额；同上语义 |
+| `account_create_count` | int NOT NULL DEFAULT 0 | 当日累计成功创建账户次数 |
+| `updated_at` | timestamptz NOT NULL DEFAULT NOW() | 最近更新时刻 |
+
+- **主键**：`(token_id, day)` 复合
+- **外键**：`token_id → gateway_admin_token(id) ON DELETE CASCADE`
+- **CHECK**：`recharge_total_minor >= 0 AND refund_total_minor >= 0 AND account_create_count >= 0`
+- **索引**：`idx_gateway_admin_token_usage_day(day)` 用于日常清理 job
+
+**用途**：阀门 `daily_recharge_quota_limit` / `daily_refund_quota_limit` / `daily_account_create_limit` 的真相源；用 ON CONFLICT DO UPDATE UPSERT 累加（行锁串行化保证并发原子性）。
+
+### 新表：`gateway_admin_token_circuit`（熔断器状态）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `token_id` | bigint NOT NULL PK FK | 关联 gateway_admin_token.id；1:0..1 关系 |
+| `window_started_at` | timestamptz NOT NULL DEFAULT NOW() | 1h 滚动窗口起点；> 1h 时下次 RecordCircuitError 重置 |
+| `error_count` | int NOT NULL DEFAULT 0 | 当前窗口内累计 4xx/5xx 数；超 100 触发 TripCircuitBreaker |
+| `breaker_tripped_until` | timestamptz NULL | 跳闸截止时间；NULL 或过去 = 未熔断；未来 = 熔断中 |
+| `updated_at` | timestamptz NOT NULL DEFAULT NOW() | 最近更新时刻 |
+
+- **主键**：`token_id` 单列（1:0..1 with `gateway_admin_token`）
+- **外键**：`token_id → gateway_admin_token(id) ON DELETE CASCADE`
+- **CHECK**：`error_count >= 0`
+
+**用途**：阀门 `circuit_breaker_enabled = true` 时，UPSERT 单语句完成窗口滚动 + 错误累加（CASE WHEN 在 DO UPDATE SET 子句内实现 1h 重置）。手工解锁路径：`ResetCircuitBreaker` query 或 SQL `UPDATE ... SET breaker_tripped_until = NULL, error_count = 0, window_started_at = NOW()`。
+
+### sqlc 生成代码
+
+`internal/db/admin_token.sql.go` 11 个函数 + 多个 Row struct：
+
+- `InsertAdminToken` / `FindActiveAdminTokenByHash` / `FindAdminTokenByID` / `RevokeAdminToken` / `ListActiveAdminTokens`
+- `IncrementTokenUsage` / `GetTokenUsage`
+- `RecordCircuitError` / `TripCircuitBreaker` / `GetCircuitState` / `ResetCircuitBreaker`
+
+类型映射（与 sqlc.yaml override 一致）：
+
+- `ip_allowlist cidr[]` → `[]netip.Prefix`（Go 1.18+ 标准库）
+- nullable `bigint` → `pgtype.Int8`
+- nullable `int` → `pgtype.Int4`
+- nullable `timestamptz` → `sql.NullTime`
