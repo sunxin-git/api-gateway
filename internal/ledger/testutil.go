@@ -30,7 +30,8 @@ func testPGDSN() string {
 
 // mustOpenTestPool 建立 pgxpool 连接；失败 t.Fatal。
 //
-// 注意：高并发测试需要更多 maxConns；testutil 默认 MaxConns=50 已覆盖 Unit 6 100 goroutine。
+// MaxConns=30：足以支撑本包并发测试（100 goroutine 会在 pool 内部排队），
+// 同时与 admintoken / admin 包并行测试时不打满 PG 默认 max_connections=100。
 func mustOpenTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := testPGDSN()
@@ -38,8 +39,8 @@ func mustOpenTestPool(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
 	}
-	cfg.MaxConns = 50
-	cfg.MinConns = 5
+	cfg.MaxConns = 30
+	cfg.MinConns = 2
 	cfg.MaxConnLifetime = 30 * time.Minute
 	cfg.MaxConnIdleTime = 5 * time.Minute
 
