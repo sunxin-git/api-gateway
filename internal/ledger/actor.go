@@ -26,6 +26,10 @@ const (
 	ActorTypeSystem ActorType = "system"
 	// ActorTypeTask 来自异步任务路径（工作流 F task service）。
 	ActorTypeTask ActorType = "task"
+	// ActorTypeBusinessKey 来自业务系统 API Key 鉴权的 HTTP 路径（F-min RelayHandler）。
+	// 与 admin_token 平行；actor_id 填业务 API Key 自增 ID（business_account_api_key.id）。
+	// PG enum 值由 migration 0004 ALTER TYPE 添加。
+	ActorTypeBusinessKey ActorType = "business_key"
 )
 
 // Actor 操作者上下文。
@@ -52,12 +56,12 @@ func (a Actor) Validate() error {
 		return errors.New("Actor.ID 不能为空")
 	}
 	switch a.Type {
-	case ActorTypeAdminToken, ActorTypeCLI, ActorTypeSystem, ActorTypeTask:
+	case ActorTypeAdminToken, ActorTypeCLI, ActorTypeSystem, ActorTypeTask, ActorTypeBusinessKey:
 		return nil
 	case "":
 		return errors.New("Actor.Type 不能为空")
 	default:
-		return fmt.Errorf("Actor.Type 非法值 %q，仅支持 admin_token|cli|system|task", a.Type)
+		return fmt.Errorf("Actor.Type 非法值 %q，仅支持 admin_token|cli|system|task|business_key", a.Type)
 	}
 }
 

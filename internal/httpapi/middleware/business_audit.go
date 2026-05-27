@@ -9,59 +9,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/sunxin-git/api-gateway/internal/audit"
+	"github.com/sunxin-git/api-gateway/internal/relay"
 )
 
-// =============================================================================
-// ctx helpers — handler 注入业务 audit 元数据
-// =============================================================================
-//
-// RelayHandler 在请求流程中调用这些 Set* helper 注入 input/output tokens / cost /
-// upstream_status 等业务字段；BusinessAudit middleware defer 时统一读 ctx 组装
-// AuditRecord 写入。
-//
-// 设计选择：分散的 Set helper（而非单一 struct）让 handler 在 Reserve → Relay →
-// Settle 各阶段渐进注入数据，与流程节奏对齐。
-
-const (
-	ctxKeyBusinessAuditOutcome          = "business_audit_outcome"
-	ctxKeyBusinessAuditInputTokens      = "business_audit_input_tokens"
-	ctxKeyBusinessAuditOutputTokens     = "business_audit_output_tokens"
-	ctxKeyBusinessAuditCostMinor        = "business_audit_cost_minor"
-	ctxKeyBusinessAuditGatewayModel     = "business_audit_gw_model"
-	ctxKeyBusinessAuditUpstreamModel    = "business_audit_up_model"
-	ctxKeyBusinessAuditUpstreamStatus   = "business_audit_up_status"
-	ctxKeyBusinessAuditUpstreamDuration = "business_audit_up_duration_ms"
-)
-
-// SetBusinessAuditOutcomeCode handler 调用注入业务级 outcome code（如 "ok" /
-// "insufficient_quota" / "upstream_5xx" / "streaming_not_supported"）。
-// audit middleware defer 时读；缺失时按 HTTP status 推断（"ok" / "client_error" / "internal_error"）。
-func SetBusinessAuditOutcomeCode(c *gin.Context, code string) {
-	c.Set(ctxKeyBusinessAuditOutcome, code)
-}
-
-// SetBusinessAuditTokens 注入上游返回的 input/output tokens（用于 audit + metric）。
-func SetBusinessAuditTokens(c *gin.Context, input, output int) {
-	c.Set(ctxKeyBusinessAuditInputTokens, input)
-	c.Set(ctxKeyBusinessAuditOutputTokens, output)
-}
-
-// SetBusinessAuditCost 注入本请求实际 commit 的 cost（minor unit）。
-func SetBusinessAuditCost(c *gin.Context, costMinor int64) {
-	c.Set(ctxKeyBusinessAuditCostMinor, costMinor)
-}
-
-// SetBusinessAuditModelInfo 注入网关 model + 上游真实 model 名（路由日志用）。
-func SetBusinessAuditModelInfo(c *gin.Context, gatewayModel, upstreamModel string) {
-	c.Set(ctxKeyBusinessAuditGatewayModel, gatewayModel)
-	c.Set(ctxKeyBusinessAuditUpstreamModel, upstreamModel)
-}
-
-// SetBusinessAuditUpstreamResult 注入上游 HTTP status + 耗时（监控用）。
-func SetBusinessAuditUpstreamResult(c *gin.Context, status int, duration time.Duration) {
-	c.Set(ctxKeyBusinessAuditUpstreamStatus, status)
-	c.Set(ctxKeyBusinessAuditUpstreamDuration, duration.Milliseconds())
-}
+// ctx Setters / Getters 集中在 internal/relay/audit_meta.go（避免 middleware ↔ relay
+// 循环依赖；relay handler 写、middleware audit 读，方向单向）。
+// RelayHandler 通过 relay.SetBusinessAudit* 注入；本 middleware defer 时通过
+// relay.GetBusinessAudit* 读取。
 
 // =============================================================================
 // BusinessAudit middleware
@@ -109,6 +63,7 @@ func BusinessAudit(
 				Status:       status,
 				DurationMs:   duration.Milliseconds(),
 				OutcomeCode:  resolveBusinessOutcomeCode(c, status),
+				// 注入 handler 元数据见下方 relay.GetBusinessAudit* 读取
 			}
 
 			// 注入业务身份
@@ -120,42 +75,14 @@ func BusinessAudit(
 				rec.Actor = "anonymous"
 			}
 
-			// 注入 handler 元数据（Set*helpers）
-			if v, ok := c.Get(ctxKeyBusinessAuditInputTokens); ok {
-				if n, ok := v.(int); ok {
-					rec.InputTokens = n
-				}
-			}
-			if v, ok := c.Get(ctxKeyBusinessAuditOutputTokens); ok {
-				if n, ok := v.(int); ok {
-					rec.OutputTokens = n
-				}
-			}
-			if v, ok := c.Get(ctxKeyBusinessAuditCostMinor); ok {
-				if n, ok := v.(int64); ok {
-					rec.CostMinor = n
-				}
-			}
-			if v, ok := c.Get(ctxKeyBusinessAuditGatewayModel); ok {
-				if s, ok := v.(string); ok {
-					rec.GatewayModel = s
-				}
-			}
-			if v, ok := c.Get(ctxKeyBusinessAuditUpstreamModel); ok {
-				if s, ok := v.(string); ok {
-					rec.UpstreamModel = s
-				}
-			}
-			if v, ok := c.Get(ctxKeyBusinessAuditUpstreamStatus); ok {
-				if n, ok := v.(int); ok {
-					rec.UpstreamStatus = n
-				}
-			}
-			if v, ok := c.Get(ctxKeyBusinessAuditUpstreamDuration); ok {
-				if n, ok := v.(int64); ok {
-					rec.UpstreamDurationMs = n
-				}
-			}
+			// 注入 handler 元数据（relay.SetBusinessAudit* 注入 → 此处统一读出）
+			rec.InputTokens = relay.GetBusinessAuditInputTokens(c)
+			rec.OutputTokens = relay.GetBusinessAuditOutputTokens(c)
+			rec.CostMinor = relay.GetBusinessAuditCostMinor(c)
+			rec.GatewayModel = relay.GetBusinessAuditGatewayModel(c)
+			rec.UpstreamModel = relay.GetBusinessAuditUpstreamModel(c)
+			rec.UpstreamStatus = relay.GetBusinessAuditUpstreamStatus(c)
+			rec.UpstreamDurationMs = relay.GetBusinessAuditUpstreamDurationMs(c)
 
 			rec.Tier = resolveBusinessTier(status)
 
@@ -198,13 +125,11 @@ func resolveBusinessTier(status int) audit.AuditTier {
 // resolveBusinessOutcomeCode 决定 audit record 的 outcome_code 字段。
 //
 // 优先级：
-//  1. handler 通过 SetBusinessAuditOutcomeCode 显式设置（如 "insufficient_quota" / "upstream_5xx"）
+//  1. handler 通过 relay.SetBusinessAuditOutcomeCode 显式设置（如 "insufficient_quota" / "upstream_5xx"）
 //  2. status 范围推断（fallback）
 func resolveBusinessOutcomeCode(c *gin.Context, status int) string {
-	if v, ok := c.Get(ctxKeyBusinessAuditOutcome); ok {
-		if s, ok := v.(string); ok && s != "" {
-			return s
-		}
+	if s := relay.GetBusinessAuditOutcomeCode(c); s != "" {
+		return s
 	}
 	switch {
 	case status >= 200 && status < 300:

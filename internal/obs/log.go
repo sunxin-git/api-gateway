@@ -7,8 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-
-	"github.com/sunxin-git/api-gateway/internal/httpapi/middleware"
 )
 
 // NewLogger 按指定等级创建 slog JSON handler，输出到 stderr。
@@ -32,7 +30,7 @@ func newLoggerWithWriter(w io.Writer, lvl slog.Level) *slog.Logger {
 	h := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level:       lvl,
 		AddSource:   false, // 性能优先，必要时按需打开
-		ReplaceAttr: middleware.RedactSensitiveAttrs(),
+		ReplaceAttr: RedactSensitiveAttrs(),
 	})
 	return slog.New(h)
 }

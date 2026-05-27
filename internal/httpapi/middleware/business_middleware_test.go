@@ -20,6 +20,7 @@ import (
 
 	"github.com/sunxin-git/api-gateway/internal/audit"
 	"github.com/sunxin-git/api-gateway/internal/businesskey"
+	"github.com/sunxin-git/api-gateway/internal/relay"
 )
 
 // =============================================================================
@@ -313,10 +314,10 @@ func TestBusinessAudit_HappyPath_EmitsTier2(t *testing.T) {
 	r := newAdminEngine()
 	r.Use(RequestID(), injectBusinessKey(k), BusinessAudit(logger, newAuditWriteFailedCounter()))
 	r.POST("/v1/chat/completions", func(c *gin.Context) {
-		SetBusinessAuditTokens(c, 100, 200)
-		SetBusinessAuditCost(c, 480)
-		SetBusinessAuditModelInfo(c, "gw-default", "doubao-1-5-pro")
-		SetBusinessAuditUpstreamResult(c, 200, 1234*1e6) // 1234ms
+		relay.SetBusinessAuditTokens(c, 100, 200)
+		relay.SetBusinessAuditCost(c, 480)
+		relay.SetBusinessAuditModelInfo(c, "gw-default", "doubao-1-5-pro")
+		relay.SetBusinessAuditUpstreamResult(c, 200, 1234*1e6) // 1234ms
 		c.String(http.StatusOK, `{"choices":[],"usage":{}}`)
 	})
 
@@ -461,7 +462,7 @@ func TestBusinessAudit_HandlerOutcomeCodeOverride(t *testing.T) {
 	r.Use(RequestID(), injectBusinessKey(k), BusinessAudit(logger, newAuditWriteFailedCounter()))
 	r.POST("/x", func(c *gin.Context) {
 		// handler 显式注入业务级 outcome code
-		SetBusinessAuditOutcomeCode(c, "insufficient_quota")
+		relay.SetBusinessAuditOutcomeCode(c, "insufficient_quota")
 		c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{})
 	})
 
@@ -471,7 +472,7 @@ func TestBusinessAudit_HandlerOutcomeCodeOverride(t *testing.T) {
 	recs := logger.snapshot()
 	require.Len(t, recs, 1)
 	assert.Equal(t, "insufficient_quota", recs[0].OutcomeCode,
-		"handler SetBusinessAuditOutcomeCode 应覆盖默认 HTTP-status 推断")
+		"handler relay.SetBusinessAuditOutcomeCode 应覆盖默认 HTTP-status 推断")
 }
 
 func TestBusinessAudit_Tier1WriteFailure_BumpsMetric(t *testing.T) {
@@ -515,10 +516,10 @@ func TestBusinessChain_HappyPath_FullChain(t *testing.T) {
 		BusinessAudit(logger, newAuditWriteFailedCounter()),
 	)
 	v1.POST("/chat/completions", func(c *gin.Context) {
-		SetBusinessAuditTokens(c, 50, 100)
-		SetBusinessAuditCost(c, 240)
-		SetBusinessAuditModelInfo(c, "gw-default", "doubao")
-		SetBusinessAuditUpstreamResult(c, 200, 500*1e6)
+		relay.SetBusinessAuditTokens(c, 50, 100)
+		relay.SetBusinessAuditCost(c, 240)
+		relay.SetBusinessAuditModelInfo(c, "gw-default", "doubao")
+		relay.SetBusinessAuditUpstreamResult(c, 200, 500*1e6)
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 
