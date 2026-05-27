@@ -14,14 +14,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-// 操作来源类型；与 actor_id 配合构成结构化审计两列
+// 操作来源类型；与 actor_id 配合构成结构化审计两列。值：admin_token / cli / system / task / business_key
 type ActorType string
 
 const (
-	ActorTypeAdminToken ActorType = "admin_token"
-	ActorTypeCli        ActorType = "cli"
-	ActorTypeSystem     ActorType = "system"
-	ActorTypeTask       ActorType = "task"
+	ActorTypeAdminToken  ActorType = "admin_token"
+	ActorTypeCli         ActorType = "cli"
+	ActorTypeSystem      ActorType = "system"
+	ActorTypeTask        ActorType = "task"
+	ActorTypeBusinessKey ActorType = "business_key"
 )
 
 func (e *ActorType) Scan(src interface{}) error {
@@ -301,6 +302,26 @@ type BusinessAccount struct {
 	Metadata        []byte       `json:"metadata"`
 	CreatedAt       time.Time    `json:"created_at"`
 	UpdatedAt       time.Time    `json:"updated_at"`
+}
+
+// 业务系统对外 API Key；与 admin token 共享 HMAC pepper（F-min 决策 D4）
+type BusinessAccountApiKey struct {
+	ID int64 `json:"id"`
+	// 关联 business_account.id；FK CASCADE 保证账户删除时 key 一并失效
+	BusinessAccountID string `json:"business_account_id"`
+	Description       string `json:"description"`
+	// HMAC-SHA-256(GATEWAY_TOKEN_PEPPER, plaintext) 的 hex 字符串（64 char）；与 admin token 同 pepper 同算法；明文绝不入库
+	KeyHash string `json:"key_hash"`
+	// RPM 上限；NULL = 不限速；按 key.id 维度计数（InProcessRPM）
+	RequestsPerMinute pgtype.Int4 `json:"requests_per_minute"`
+	// 创建者标识；MVP admin-cli 硬编码 cli:bootstrap
+	CreatedBy string    `json:"created_by"`
+	CreatedAt time.Time `json:"created_at"`
+	// 吊销时间；NULL = 未吊销；查询 WHERE revoked_at IS NULL 过滤
+	RevokedAt sql.NullTime `json:"revoked_at"`
+	// 最近鉴权命中时刻；best-effort 异步批量更新（不阻塞鉴权热路径）
+	LastUsedAt sql.NullTime `json:"last_used_at"`
+	UpdatedAt  time.Time    `json:"updated_at"`
 }
 
 // 账户余额投影：ledger 严格投影；drift 检测命中即冻结（CONTEXT.md balance）
