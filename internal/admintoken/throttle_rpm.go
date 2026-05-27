@@ -51,6 +51,18 @@ type tokenRPMState struct {
 //
 // 返回的 RPM 实例必须最终调 Close() 停 GC goroutine（main.go defer）。
 func NewInProcessRPM(log *slog.Logger, onColdStart func()) *InProcessRPM {
+	r := newInProcessRPMBase(log, onColdStart)
+	r.gcDoneCh = make(chan struct{})
+	go r.gcLoop()
+	return r
+}
+
+// newInProcessRPMBase 构造 InProcessRPM 但**不**启动 GC goroutine。
+//
+// 仅供包内测试用：避免 GC goroutine 与测试主线对 now / gcInterval / idleThreshold
+// 等字段产生数据竞争（race detector 触发）。测试需要 GC 时显式调 r.gcOnce()。
+// gcDoneCh 留 nil；Close 检测 nil 跳过等待。
+func newInProcessRPMBase(log *slog.Logger, onColdStart func()) *InProcessRPM {
 	if log == nil {
 		panic("admintoken.NewInProcessRPM: log 不能为 nil")
 	}
@@ -59,9 +71,9 @@ func NewInProcessRPM(log *slog.Logger, onColdStart func()) *InProcessRPM {
 		gcInterval:    5 * time.Minute,
 		idleThreshold: 10 * time.Minute,
 		gcStopCh:      make(chan struct{}),
-		gcDoneCh:      make(chan struct{}),
-		onColdStart:   onColdStart,
-		log:           log,
+		// gcDoneCh 不分配；NewInProcessRPM 启动 goroutine 时才分配
+		onColdStart: onColdStart,
+		log:         log,
 	}
 
 	// 进程冷启 hook：让 Unit 7 注入 metric bump
@@ -69,17 +81,24 @@ func NewInProcessRPM(log *slog.Logger, onColdStart func()) *InProcessRPM {
 		onColdStart()
 	}
 	log.Info("InProcessRPM 启动；RPM 计数已清零（进程重启即归零，多实例计数独立）")
-
-	go r.gcLoop()
 	return r
 }
 
 // Close 停 GC goroutine；调用方应在进程退出时 defer 调用。
 //
 // 已 Close 的 RPM 实例不应再 Check（行为未定义；P0 当前 panic）。
+// 测试构造（newInProcessRPMBase）无 GC goroutine，gcDoneCh 为 nil，Close 立即返回。
+// 多次 Close 幂等。
 func (r *InProcessRPM) Close() error {
-	close(r.gcStopCh)
-	<-r.gcDoneCh
+	select {
+	case <-r.gcStopCh:
+		// 已 close，幂等返回
+	default:
+		close(r.gcStopCh)
+	}
+	if r.gcDoneCh != nil {
+		<-r.gcDoneCh
+	}
 	return nil
 }
 

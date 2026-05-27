@@ -200,11 +200,11 @@ func TestRPM_PanicOnNilLogger(t *testing.T) {
 	_ = NewInProcessRPM(nil, nil)
 }
 
-// newTestRPM 构造一个测试用 InProcessRPM；GC interval 调小避免测试卡 5 分钟。
+// newTestRPM 构造一个测试用 InProcessRPM；不启动 GC goroutine，避免与测试主线
+// 对 now / gcInterval / idleThreshold 等字段产生 race（race detector 触发）。
+// 测试需要 GC 时显式调 r.gcOnce()。
 func newTestRPM() *InProcessRPM {
-	r := NewInProcessRPM(newSilentLogger(), nil)
-	r.gcInterval = time.Hour // 测试用；不让自动 GC 干扰；测试用 gcOnce() 手动触发
-	return r
+	return newInProcessRPMBase(newSilentLogger(), nil)
 }
 
 // =============================================================================
