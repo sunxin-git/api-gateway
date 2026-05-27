@@ -22,6 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/sunxin-git/api-gateway/internal/admintoken"
 	"github.com/sunxin-git/api-gateway/internal/config"
 	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/obs"
@@ -38,6 +39,9 @@ type CLIServices struct {
 	Service *ledger.PostgresService
 	// Reconciler 已构造的 reconciler；CLI 仅调 RunOnce，不调用 Run。
 	Reconciler *ledger.Reconciler
+	// AdminToken Admin Token 域服务（token create / list / revoke 走它；D-min Unit 6）。
+	// 注入 cfg.TokenPepperBytes，hash 算法与 HTTP 鉴权路径一致。
+	AdminToken *admintoken.PostgresService
 	// Log slog logger（admin-cli 输出到 stderr，避免污染 stdout JSON）。
 	Log *slog.Logger
 	// Metrics 完整 Prometheus 指标容器；CLI 路径不暴露 /metrics，但 reconciler 需要它 bump 计数。
@@ -97,10 +101,14 @@ func OpenServices(ctx context.Context) (*CLIServices, func(), error) {
 		Metrics:     metrics,
 	})
 
+	// Admin Token 域服务（D-min Unit 6）；hash pepper 与 HTTP 路径同源 → CLI 创出 token 可被进程鉴权命中。
+	tokenSvc := admintoken.NewPostgresService(pool, cfg.TokenPepperBytes, logger)
+
 	svc := &CLIServices{
 		Pool:       pool,
 		Service:    service,
 		Reconciler: reconciler,
+		AdminToken: tokenSvc,
 		Log:        logger,
 		Metrics:    metrics,
 	}

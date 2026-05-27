@@ -56,9 +56,11 @@ func runCmdSeparate(t *testing.T, args ...string) (stdout, stderr string, err er
 func setupPGEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("PG_DSN", testPGDSN())
-	// 这两个 secret 仅做 fail-fast 校验：admin-cli 现有路径不实际使用其值。
+	// 这几个 secret 仅做 fail-fast 校验：admin-cli 现有路径不实际使用其值。
 	t.Setenv("GATEWAY_KEK_V1", "Y2xpLXRlc3Qta2VrLTEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=") // base64 占位，仅过 validate
 	t.Setenv("ADMIN_TOKEN_SIGNING_KEY", "cli-test-signing-key")
+	// D-min Unit 7 起：所有环境强制 GATEWAY_TOKEN_PEPPER ≥ 32 字节
+	t.Setenv("GATEWAY_TOKEN_PEPPER", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 	// 让 config.Load 不读真实 .env.local（如果存在）干扰测试 env。
 	// koanf 的加载顺序是 default → .env.local → env，env 胜出；测试 env 已注入，
 	// 但 .env.local 里若有 PG_DSN 仍会被 env 覆盖，故无需特殊处理。
@@ -224,13 +226,9 @@ func TestMigrateVersion占位返回错误(t *testing.T) {
 	assert.Contains(t, err.Error(), "尚未实现")
 }
 
-func TestTokenCreate占位返回错误(t *testing.T) {
-	_, err := runCmd(t, "token", "create",
-		"--scope", "business_account:read",
-		"--ip-allowlist", "10.0.0.0/8")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "尚未实现")
-}
+// 注：原 TestTokenCreate占位返回错误 已删除。
+// token create 真实实装见 token_test.go（D-min Unit 6）；缺 --description 行为已在
+// TestTokenCreate_MissingRequiredFlags 中覆盖。
 
 // =============================================================================
 // account create — 入参校验测试（不需要 PG）
