@@ -5,6 +5,37 @@ import (
 	"time"
 )
 
+// WriteOutcome 账本写操作结果类型（计划 R11+D11，D-min document-review 添加）。
+//
+// Recharge / Refund 同时支持"首次新写"和"幂等命中"两条路径；调用方（D-min handler）
+// 需区分二者：
+//   - FreshlyWritten：本次调用产生了新 ledger entry（INSERT 成功）；handler 应累加 daily 配额
+//   - IdempotentReplay：本次调用命中既有 entry（idempotency_key 或 correlation_id UNIQUE）；
+//     handler **不**累加配额（已在首次写时累过），但返回的 *LedgerEntry 仍是有效结果
+//
+// 没有这个区分时，业务系统重试场景下 handler 会双重累加 daily 配额 → 配额被人为膨胀
+// → 合法请求被误拒 429。
+type WriteOutcome int
+
+const (
+	// WriteOutcomeFreshlyWritten 本次调用产生了新 ledger entry。
+	WriteOutcomeFreshlyWritten WriteOutcome = iota + 1
+	// WriteOutcomeIdempotentReplay 本次调用命中既有 entry（幂等命中，无新 entry 写入）。
+	WriteOutcomeIdempotentReplay
+)
+
+// String 返回可读形式，便于日志输出。
+func (o WriteOutcome) String() string {
+	switch o {
+	case WriteOutcomeFreshlyWritten:
+		return "freshly_written"
+	case WriteOutcomeIdempotentReplay:
+		return "idempotent_replay"
+	default:
+		return "unknown"
+	}
+}
+
 // Service 账本服务接口（计划 R6 / Unit 3）。
 //
 // 实现：PostgresService（internal/ledger/postgres.go）。
@@ -24,13 +55,17 @@ import (
 //   - Reserve/Commit/Release/Refund：(business_account_id, correlation_id, entry_type) 复合 UNIQUE；同 correlation 直接返原 entry
 type Service interface {
 	// CreateAccount 创建业务账户（同事务建 balance(zeros) + outbox account.created）。
-	// 错误：账户已存在 → 由 UNIQUE 冲突包装的 error（不映射为 sentinel）。
+	// 错误：账户已存在 → ErrAccountAlreadyExists（决策 D12，D-min document-review 修订）。
 	CreateAccount(ctx context.Context, actor Actor, params CreateAccountParams) (*Account, error)
 
 	// Recharge 充值入账。
 	// 入口校验 amount > 0；CAS 含 frozen=false。
 	// 错误：ErrInvalidAmount / ErrAccountNotFound / ErrAccountFrozen / ErrVersionConflict / ErrIdempotencyConflict。
-	Recharge(ctx context.Context, actor Actor, params RechargeParams) (*LedgerEntry, error)
+	//
+	// 返回 WriteOutcome 区分"首次新写" vs "幂等命中"（D11 + D-min document-review）：
+	//   - FreshlyWritten：新 entry 写入；调用方累加 daily 配额
+	//   - IdempotentReplay：idempotency_key 命中且 body 一致，返原 entry；调用方**不**累加配额
+	Recharge(ctx context.Context, actor Actor, params RechargeParams) (*LedgerEntry, WriteOutcome, error)
 
 	// Reserve 预占额度。
 	// 入口校验 amount > 0；CAS 含 frozen=false AND available >= amount。
@@ -52,7 +87,9 @@ type Service interface {
 	// Refund 退款（used_total 减 + available 增 + refund_total 增）。
 	// 不查 frozen（管理动作允许）；refund_total 不进不变量等式。
 	// 错误：ErrInvalidAmount / ErrAccountNotFound / ErrInsufficientUsed / ErrVersionConflict。
-	Refund(ctx context.Context, actor Actor, params RefundParams) (*LedgerEntry, error)
+	//
+	// 返回 WriteOutcome 区分"首次新写" vs "幂等命中"（D11 + D-min document-review）。
+	Refund(ctx context.Context, actor Actor, params RefundParams) (*LedgerEntry, WriteOutcome, error)
 
 	// GetBalance 读取账户当前余额（含 frozen 状态）。
 	// 错误：ErrAccountNotFound。

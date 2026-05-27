@@ -54,6 +54,45 @@ type Metrics struct {
 	// LedgerRebuildStuckTotal RebuildBalance 卡在 rebuild_in_progress 超阈值的账户次数。
 	// 标签：account_id。
 	LedgerRebuildStuckTotal *prometheus.CounterVec
+
+	// ===== Phase 2 工作流 D-min（Unit 7）：Admin API 指标 =====
+	//
+	// 命名约定：gateway_admin_*；与现有 gateway_* 系列一致。
+
+	// AdminAPIQuotaExceededTotal 阀门触发次数（throttle 中间件 + handler 预检）。
+	// 标签：quota_type（rpm | circuit_open | single_recharge | daily_recharge | single_refund |
+	//                  daily_refund | daily_create）、token_id。
+	AdminAPIQuotaExceededTotal *prometheus.CounterVec
+
+	// AdminAPIAuthFailedTotal 鉴权失败计数。
+	// 标签：reason（missing_header | bad_scheme | empty_token | token_invalid |
+	//             ip_not_allowed | invalid_ip | insufficient_scope | internal_error）。
+	AdminAPIAuthFailedTotal *prometheus.CounterVec
+
+	// AdminAPIBodyTooLargeTotal 请求体超 64KiB 拒绝次数；pre-auth 阶段，不带 token_id 标签。
+	AdminAPIBodyTooLargeTotal prometheus.Counter
+
+	// AdminAPIIdempotencyConflictTotal 同 external_ref 不同 body 触发 ErrIdempotencyConflict 次数。
+	// 标签：token_id。值 > 0 通常是业务系统 bug 或攻击重放。
+	AdminAPIIdempotencyConflictTotal *prometheus.CounterVec
+
+	// AdminAPIXFFRejectedTotal 请求源 IP ≠ trusted proxy 但携带 X-Forwarded-For 头时累加。
+	// 标签：reason（untrusted_source / malformed_xff）。
+	AdminAPIXFFRejectedTotal *prometheus.CounterVec
+
+	// AdminAuditWriteFailedTotal Tier1 / Tier2 sink emit 失败次数。
+	// 标签：tier（tier1 | tier2 | unknown）、reason。
+	// 值 > 0 让 /readyz 关闸（plan Unit 7 §1.5）。
+	AdminAuditWriteFailedTotal *prometheus.CounterVec
+
+	// AdminTokenCorruptTotal 启动期 CIDR sweep 或运行期发现 token 数据损坏次数。
+	// 标签：token_id、reason（malformed_cidr / unexpected_field / ...）。
+	AdminTokenCorruptTotal *prometheus.CounterVec
+
+	// AdminThrottleRPMColdStartTotal 进程启动时 InProcessRPM 冷启次数（每次进程启动 +1）。
+	// 标签：instance_id（main.go 装配时填 hostname / pod name；为空填 "unknown"）。
+	// 让运维通过短期内 spike 识别"OOM 重启 / liveness 循环重启绕 RPM"信号。
+	AdminThrottleRPMColdStartTotal *prometheus.CounterVec
 }
 
 // NewMetrics 构造并注册所有指标。version/commit 通常通过 ldflags 注入；Phase 1 写 "dev"。
@@ -148,25 +187,94 @@ func NewMetrics(version, commit string) *Metrics {
 		[]string{"account_id"},
 	)
 
+	// ===== D-min Unit 7 admin_api_* 指标 =====
+
+	adminQuotaExceeded := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_admin_api_quota_exceeded_total",
+			Help: "Admin API 阀门触发次数（rpm / circuit_open / single_recharge / daily_* / single_refund / daily_create）",
+		},
+		[]string{"quota_type", "token_id"},
+	)
+	adminAuthFailed := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_admin_api_auth_failed_total",
+			Help: "Admin API 鉴权失败计数（missing_header / bad_scheme / token_invalid / ip_not_allowed / insufficient_scope / ...）",
+		},
+		[]string{"reason"},
+	)
+	adminBodyTooLarge := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gateway_admin_api_body_too_large_total",
+			Help: "Admin API 请求体超 64 KiB 拒绝次数（pre-auth；不带 token_id 标签）",
+		},
+	)
+	adminIdempConflict := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_admin_api_idempotency_conflict_total",
+			Help: "Admin API 同 external_ref 不同 body 触发 idempotency_conflict 次数",
+		},
+		[]string{"token_id"},
+	)
+	adminXFFRejected := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_admin_api_xff_rejected_total",
+			Help: "请求源 IP ≠ trusted proxy 但携带 X-Forwarded-For 头时累加（配置错误信号）",
+		},
+		[]string{"reason"},
+	)
+	adminAuditWriteFailed := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_admin_audit_write_failed_total",
+			Help: "Admin audit sink emit 失败次数；值 > 0 让 /readyz 关闸",
+		},
+		[]string{"tier", "reason"},
+	)
+	adminTokenCorrupt := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_admin_token_corrupt_total",
+			Help: "Admin token CIDR sweep 发现数据损坏次数",
+		},
+		[]string{"token_id", "reason"},
+	)
+	adminRPMColdStart := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_admin_throttle_rpm_cold_start_total",
+			Help: "InProcessRPM 冷启次数（每次进程启动 +1）；短期 spike 提示 OOM/liveness 循环重启",
+		},
+		[]string{"instance_id"},
+	)
+
 	reg.MustRegister(
 		httpReqDur, buildInfo, panicTotal,
 		driftTotal, driftFalsePositive,
 		reconRunDur, reconOverload, reconPanic,
 		reconPaused, reconSkipped, rebuildStuck,
+		adminQuotaExceeded, adminAuthFailed, adminBodyTooLarge,
+		adminIdempConflict, adminXFFRejected, adminAuditWriteFailed,
+		adminTokenCorrupt, adminRPMColdStart,
 	)
 
 	return &Metrics{
-		Registry:                      reg,
-		HTTPRequestDuration:           httpReqDur,
-		BuildInfo:                     buildInfo,
-		PanicTotal:                    panicTotal,
-		LedgerDriftTotal:              driftTotal,
-		LedgerDriftFalsePositiveTotal: driftFalsePositive,
-		ReconcilerRunDuration:         reconRunDur,
-		ReconcilerOverloadTotal:       reconOverload,
-		ReconcilerPanicTotal:          reconPanic,
-		ReconcilerPaused:              reconPaused,
-		ReconcilerSkippedTotal:        reconSkipped,
-		LedgerRebuildStuckTotal:       rebuildStuck,
+		Registry:                         reg,
+		HTTPRequestDuration:              httpReqDur,
+		BuildInfo:                        buildInfo,
+		PanicTotal:                       panicTotal,
+		LedgerDriftTotal:                 driftTotal,
+		LedgerDriftFalsePositiveTotal:    driftFalsePositive,
+		ReconcilerRunDuration:            reconRunDur,
+		ReconcilerOverloadTotal:          reconOverload,
+		ReconcilerPanicTotal:             reconPanic,
+		ReconcilerPaused:                 reconPaused,
+		ReconcilerSkippedTotal:           reconSkipped,
+		LedgerRebuildStuckTotal:          rebuildStuck,
+		AdminAPIQuotaExceededTotal:       adminQuotaExceeded,
+		AdminAPIAuthFailedTotal:          adminAuthFailed,
+		AdminAPIBodyTooLargeTotal:        adminBodyTooLarge,
+		AdminAPIIdempotencyConflictTotal: adminIdempConflict,
+		AdminAPIXFFRejectedTotal:         adminXFFRejected,
+		AdminAuditWriteFailedTotal:       adminAuditWriteFailed,
+		AdminTokenCorruptTotal:           adminTokenCorrupt,
+		AdminThrottleRPMColdStartTotal:   adminRPMColdStart,
 	}
 }

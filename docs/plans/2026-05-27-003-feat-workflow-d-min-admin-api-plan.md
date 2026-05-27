@@ -1,9 +1,10 @@
 ---
 title: Phase 2 工作流 D-min — 最小 Admin API
 type: feat
-status: active
+status: completed
 date: 2026-05-27
 deepened: 2026-05-27
+completed: 2026-05-27
 ---
 
 # Phase 2 工作流 D-min — 最小 Admin API

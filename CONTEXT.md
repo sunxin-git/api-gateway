@@ -186,16 +186,51 @@ Admin Token 的细粒度权限范围，如：
 ### IP allowlist
 Token 级源 IP 白名单，CIDR 格式。未在 allowlist 内的请求直接 401，不消耗限流配额。
 
-### 阀门（quota gates）
-Token 级硬性额度限制：
-- `daily_recharge_quota_limit`：单日充值上限
-- `daily_account_create_limit`：单日创建账户上限
-- `single_recharge_max`：单笔充值最大值
-- `requests_per_minute`：QPS 上限
-- `circuit_breaker`：自动熔断（1 小时内 N 次 4xx/5xx 触发暂停）
+### 阀门（quota gates / throttle）
+Token 级硬性额度限制（D-min Unit 3 落地）：
+- `single_recharge_max`：单笔充值上限
+- `daily_recharge_quota_limit`：当日累计充值上限（UTC day）
+- `single_refund_max`：单笔退款上限（D-min document-review 添加，防 leaked refund-scope token 一次清空 used_total）
+- `daily_refund_quota_limit`：当日累计退款上限（UTC day）
+- `daily_account_create_limit`：当日创建账户上限
+- `requests_per_minute`：RPM 上限（进程内 ring buffer；P0 单实例计数，P1 接 Redis）
+- `circuit_breaker_enabled`：自动熔断（1 小时内 100 次 4xx/5xx 触发跳闸 1 小时）
 
-### 充值幂等键
-`sha256(external_ref + canonical_body)`。相同键返回原结果 200；相同 ref 但不同 body 返回 409 + 审计 + 告警。
+**两步式语义（决策 D2 + D11）**：handler 流程分 `Check*` 预检 + LedgerService 调用 + `Record*` 累加；
+LedgerService 返 `WriteOutcomeFreshlyWritten` 时才 Record（IdempotentReplay 不累加，避免业务系统重试膨胀配额）。
+
+### 熔断器（circuit breaker）
+Token 级跳闸状态机：1 小时滚动窗口内 error_count ≥ 100 → 写 `breaker_tripped_until = NOW() + 1h`，
+中间件 `CheckCircuitBreaker` 命中后返 ErrCircuitOpen → 429。到期自动闸合（不走半开）；运维手工解锁路径见
+`admintoken.ResetCircuitBreaker`。
+
+### minor unit（最小货币单位）
+所有 `amount` / `*_max` / `*_limit` 字段的单位：**1 元 = 100 分**（CNY）。
+当前 P0 仅支持 CNY；多货币是 Phase 3+ 决策，引入时 schema 必须增 currency 字段，禁止复用同 `*_limit` 字段意义漂移。
+
+### canonical body sha256
+充值幂等键的真相值：`sha256(canonicalize(RechargeBody{account_id, amount, external_ref}))`。
+service 层在 idempotency_key 命中既存 entry 时比对 body sha256；一致 → 返原 entry（`IdempotentReplay`）；
+不一致 → `ErrIdempotencyConflict` 409 + Tier1 critical audit。
+
+### Token Pepper（HMAC 主密钥）
+环境变量 `GATEWAY_TOKEN_PEPPER`（hex 或 base64 编码 ≥ 32 字节随机串）。
+token_hash 算法 = `HMAC-SHA-256(pepper, plaintext)` hex。决策依据见 D-min plan §决策 D1：
+DB 全量泄露但 env 未泄时，攻击者拿到 hash 也无法离线穷举（需先突破 pepper）。
+Pepper 丢失会让所有 token 立刻失效；与 KEK 同级关键密钥，必须列入 SOP 备份目录。
+
+### Bearer Token
+Admin API 鉴权方式：`Authorization: Bearer <plaintext>`。仅支持 header；不支持 query string / cookie
+（避免明文 token 出现在 URL / referer / 日志）。失败路径不消耗限流配额（IP allowlist / token 不存在 → 401，throttle 不计）。
+
+### audit Tier
+Admin API 审计日志分层（决策 D3）：
+- **Tier1**：refund / token lifecycle / idempotency_conflict / auth_failed → 同步 O_APPEND+O_SYNC 写本地文件，写失败让 `/readyz` 关闸
+- **Tier2**：create / recharge / balance read 等 → 异步 slog stderr，best-effort
+
+### whoami
+任何已鉴权 token 都可调的自检端点 `GET /admin/v1/whoami`，返回 token 元数据 + 阀门快照 +
+今日累计用量 + 熔断状态。**不**返回 token_hash / ip_allowlist 具体 CIDR 列表（防泄露后嗅探精确网段）。
 
 ---
 

@@ -175,7 +175,7 @@ func TestRechargeAmountNegative(t *testing.T) {
 	ctx := ctxT(t)
 	actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
 	for _, amt := range []int64{-1, -100, -9999} {
-		_, err := svc.Recharge(ctx, actor, RechargeParams{
+		_, _, err := svc.Recharge(ctx, actor, RechargeParams{
 			AccountID: "x", Amount: amt,
 		})
 		require.ErrorIs(t, err, ErrInvalidAmount, "amount=%d 应拒绝", amt)
@@ -187,7 +187,7 @@ func TestRefundAmountNegative(t *testing.T) {
 	ctx := ctxT(t)
 	actor := Actor{Type: ActorTypeCLI, ID: "bootstrap"}
 	for _, amt := range []int64{-1, -100, -9999} {
-		_, err := svc.Refund(ctx, actor, RefundParams{
+		_, _, err := svc.Refund(ctx, actor, RefundParams{
 			AccountID: "x", Amount: amt, CorrelationID: "c",
 		})
 		require.ErrorIs(t, err, ErrInvalidAmount, "amount=%d 应拒绝", amt)

@@ -9,13 +9,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setMinimalRequiredEnv 设置三项必填环境变量，让 validate 通过。
-// 返回一个清理函数（defer 调用）。
+// setMinimalRequiredEnv 设置必填环境变量，让 validate 通过。
+// 包含 D-min Unit 7 新增的 GATEWAY_TOKEN_PEPPER（所有环境强制 ≥ 32 字节）。
 func setMinimalRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("PG_DSN", "postgres://test:test@localhost:5432/test?sslmode=disable")
 	t.Setenv("GATEWAY_KEK_V1", "dGVzdC1rZWstdjE=") // base64("test-kek-v1")
 	t.Setenv("ADMIN_TOKEN_SIGNING_KEY", "test-admin-signing-key")
+	// GATEWAY_TOKEN_PEPPER：32 字节 hex = 64 字符
+	t.Setenv("GATEWAY_TOKEN_PEPPER", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 }
 
 func TestLoad默认值生效(t *testing.T) {
@@ -107,6 +109,7 @@ LOG_LEVEL=warn
 PG_DSN=postgres://from-file
 GATEWAY_KEK_V1=kek-from-file
 ADMIN_TOKEN_SIGNING_KEY=signkey-from-file
+GATEWAY_TOKEN_PEPPER=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 `
 	require.NoError(t, os.WriteFile(envFile, []byte(content), 0o600))
 
@@ -150,6 +153,185 @@ func TestParseOrigins(t *testing.T) {
 	}
 }
 
+// =============================================================================
+// D-min Unit 7 fail-fast 矩阵
+// =============================================================================
+
+func TestPepper_MissingFails(t *testing.T) {
+	clearGatewayEnv(t)
+	t.Setenv("PG_DSN", "postgres://t")
+	t.Setenv("GATEWAY_KEK_V1", "x")
+	t.Setenv("ADMIN_TOKEN_SIGNING_KEY", "x")
+	// 不设 GATEWAY_TOKEN_PEPPER
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_TOKEN_PEPPER")
+}
+
+func TestPepper_TooShortFails(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	// 31 字节 hex = 62 字符
+	t.Setenv("GATEWAY_TOKEN_PEPPER", "00112233445566778899aabbccddeeff00112233445566778899aabbccddee")
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "32 字节")
+}
+
+func TestPepper_InvalidEncodingFails(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	// 既非 hex 也非 base64
+	t.Setenv("GATEWAY_TOKEN_PEPPER", "@@@illegal@@@")
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_TOKEN_PEPPER")
+}
+
+func TestPepper_Base64Accepted(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	// 32 字节 base64：base64.StdEncoding.EncodeToString(make([]byte,32))
+	t.Setenv("GATEWAY_TOKEN_PEPPER", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.Len(t, cfg.TokenPepperBytes, 32)
+}
+
+func TestTrustedProxies_ProductionMissingFails(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_FRONT_TLS_ACK", "true")
+	// 不设 GATEWAY_TRUSTED_PROXIES
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_TRUSTED_PROXIES")
+}
+
+func TestTrustedProxies_ProductionWildcardRejected(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_FRONT_TLS_ACK", "true")
+	t.Setenv("GATEWAY_TRUSTED_PROXIES", "0.0.0.0/0")
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "0.0.0.0/0")
+}
+
+func TestTrustedProxies_ProductionMalformedRejected(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_FRONT_TLS_ACK", "true")
+	t.Setenv("GATEWAY_TRUSTED_PROXIES", "not-a-cidr")
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_TRUSTED_PROXIES")
+}
+
+func TestTrustedProxies_ProductionValidPasses(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_FRONT_TLS_ACK", "true")
+	t.Setenv("GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8,127.0.0.1/32")
+	t.Setenv("ADMIN_AUDIT_HIGH_VALUE_LOG_PATH", "/tmp/audit.log")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.0.0.0/8", "127.0.0.1/32"}, cfg.TrustedProxyCIDRs)
+}
+
+func TestTrustedProxies_DevEmptyOK(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	// 不设 GATEWAY_ENV → dev
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.Empty(t, cfg.TrustedProxyCIDRs)
+	assert.Equal(t, EnvDev, cfg.GatewayEnv)
+}
+
+func TestTLS_ProductionMissingTLSAndAckFails(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8")
+	// 不设 LISTEN_TLS / FRONT_TLS_ACK
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "TLS")
+}
+
+func TestTLS_ProductionListenTLSWithoutCertFails(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8")
+	t.Setenv("GATEWAY_LISTEN_TLS", "true")
+	t.Setenv("ADMIN_AUDIT_HIGH_VALUE_LOG_PATH", "/tmp/audit.log")
+	// 不设 cert/key
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "TLS_CERT_PATH")
+}
+
+func TestTLS_ProductionListenTLSWithMissingFiles(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8")
+	t.Setenv("GATEWAY_LISTEN_TLS", "true")
+	t.Setenv("GATEWAY_TLS_CERT_PATH", "/nonexistent/cert.pem")
+	t.Setenv("GATEWAY_TLS_KEY_PATH", "/nonexistent/key.pem")
+	t.Setenv("ADMIN_AUDIT_HIGH_VALUE_LOG_PATH", "/tmp/audit.log")
+	_, err := Load("")
+	require.Error(t, err)
+}
+
+func TestTLS_ProductionFrontAckOK(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8")
+	t.Setenv("GATEWAY_FRONT_TLS_ACK", "true")
+	t.Setenv("ADMIN_AUDIT_HIGH_VALUE_LOG_PATH", "/tmp/audit.log")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.True(t, cfg.FrontTLSAck)
+}
+
+func TestAdminAuditPath_ProductionRequired(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ENV", "production")
+	t.Setenv("GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8")
+	t.Setenv("GATEWAY_FRONT_TLS_ACK", "true")
+	// 不设 ADMIN_AUDIT_HIGH_VALUE_LOG_PATH
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ADMIN_AUDIT_HIGH_VALUE_LOG_PATH")
+}
+
+func TestNormalizeEnv(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"production", EnvProduction},
+		{"PRODUCTION", EnvProduction},
+		{" Dev ", EnvDev},
+		{"", EnvDev},
+		{"staging", EnvDev}, // 未知值 fallback dev
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			assert.Equal(t, tc.want, normalizeEnv(tc.in))
+		})
+	}
+}
+
 // clearGatewayEnv 清掉本测试关心的所有 env，避免外部环境干扰。
 func clearGatewayEnv(t *testing.T) {
 	t.Helper()
@@ -162,6 +344,16 @@ func clearGatewayEnv(t *testing.T) {
 		"ADMIN_TOKEN_SIGNING_KEY",
 		"OTEL_EXPORTER",
 		"CORS_ALLOWED_ORIGINS",
+		"LEDGER_DRIFT_ACTION",
+		// D-min Unit 7 新增
+		"GATEWAY_ENV",
+		"GATEWAY_TRUSTED_PROXIES",
+		"GATEWAY_LISTEN_TLS",
+		"GATEWAY_FRONT_TLS_ACK",
+		"GATEWAY_TLS_CERT_PATH",
+		"GATEWAY_TLS_KEY_PATH",
+		"GATEWAY_TOKEN_PEPPER",
+		"ADMIN_AUDIT_HIGH_VALUE_LOG_PATH",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")

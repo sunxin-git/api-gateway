@@ -17,6 +17,12 @@ var (
 	// 由 D-min 后续细分）。
 	ErrAccountNotFound = errors.New("business account not found")
 
+	// ErrAccountAlreadyExists CreateAccount UNIQUE 冲突 —— 同 business_account_id 已存在。
+	// 由 D-min document-review 添加（决策 D12）：原实现把 23505 透传成裸 pgconn.PgError，
+	// D-min HTTP 层 errors.Is 无法匹配 → 错误映射为 500，业务系统重试只会继续 500。
+	// 显式 sentinel 让 handler 正确映射为 409 account_already_exists。
+	ErrAccountAlreadyExists = errors.New("business account already exists")
+
 	// ErrAccountFrozen 账户已被 freeze（drift 检测命中 / 手工冻结）；
 	// Recharge/Reserve 拒绝；Commit/Release/Refund 允许继续完成 inflight。
 	ErrAccountFrozen = errors.New("business account is frozen")

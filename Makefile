@@ -82,9 +82,9 @@ build:
 run:
 	go run .
 
-## test: 跑所有单元测试
+## test: 跑所有单元测试（-p=1 顺序跑各包，避免并行时多包 pgxpool 加总超 PG max_connections=100）
 test:
-	go test ./... -race -count=1
+	go test ./... -race -count=1 -p=1
 
 ## lint: golangci-lint 全量检查
 lint:

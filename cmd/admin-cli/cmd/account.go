@@ -122,7 +122,7 @@ func newAccountRechargeCmd() *cobra.Command {
 				Amount:      amount,
 				ExternalRef: idempotencyKey,
 			}
-			entry, err := svc.Service.Recharge(ctx, cliActor(), ledger.RechargeParams{
+			entry, _, err := svc.Service.Recharge(ctx, cliActor(), ledger.RechargeParams{
 				AccountID:      businessID,
 				Amount:         amount,
 				IdempotencyKey: idempotencyKey,

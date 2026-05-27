@@ -46,6 +46,9 @@ jobs:
       # 仅 CI 用占位，不暴露真实密钥
       GATEWAY_KEK_V1: "Y2lfa2VrX3BsYWNlaG9sZGVyXzMyX2J5dGVzX2Jhc2U2NA=="
       ADMIN_TOKEN_SIGNING_KEY: "ci_signing_key_placeholder_64_hex_chars_for_test_use_only_aabbccdd"
+      # D-min Unit 7 引入：所有环境强制 GATEWAY_TOKEN_PEPPER ≥ 32 字节（HMAC token hash）
+      # 64 hex chars = 32 bytes；CI 占位，不暴露真实密钥
+      GATEWAY_TOKEN_PEPPER: "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee"
       # 工具版本（与 Makefile 中一致）
       MIGRATE_VERSION: "v4.18.3"
       GOLANGCI_LINT_VERSION: "v2.12.2"

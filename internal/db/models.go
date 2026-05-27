@@ -390,7 +390,7 @@ type ChannelRoutingRule struct {
 // Admin Token：业务系统调网关的认证凭据（CONTEXT.md Admin Token）
 type GatewayAdminToken struct {
 	ID int64 `json:"id"`
-	// bcrypt/argon2id 哈希；明文绝不入库
+	// HMAC-SHA-256(GATEWAY_TOKEN_PEPPER, token_plaintext) 的 hex 字符串（64 char）；token 明文绝不入库；pepper 通过 env 注入，DB 泄露但 env 未泄时 hash 无法离线穷举
 	TokenHash   string `json:"token_hash"`
 	Description string `json:"description"`
 	// 细粒度权限范围；推荐生产环境只授权必要 scope
@@ -407,6 +407,36 @@ type GatewayAdminToken struct {
 	CreatedAt               time.Time    `json:"created_at"`
 	ExpiresAt               sql.NullTime `json:"expires_at"`
 	RevokedAt               sql.NullTime `json:"revoked_at"`
+	// 单笔退款金额上限（minor unit, CNY 分）；NULL = 无限制。document-review 添加
+	SingleRefundMax pgtype.Int8 `json:"single_refund_max"`
+	// 当日累计退款金额上限（minor unit, UTC day）；NULL = 无限制
+	DailyRefundQuotaLimit pgtype.Int8 `json:"daily_refund_quota_limit"`
+}
+
+// Admin Token 熔断器状态；1h 滚动窗口；100 次 4xx/5xx 触发跳闸 1h
+type GatewayAdminTokenCircuit struct {
+	TokenID int64 `json:"token_id"`
+	// 1h 滚动窗口起点；下次 RecordCircuitError 时若 > 1h 则重置
+	WindowStartedAt time.Time `json:"window_started_at"`
+	// 当前窗口内累计错误数；> 100 触发 TripCircuitBreaker
+	ErrorCount int32 `json:"error_count"`
+	// 跳闸截止时间；NULL 或过去 = 未熔断；未来 = 熔断中，middleware 拒绝请求
+	BreakerTrippedUntil sql.NullTime `json:"breaker_tripped_until"`
+	UpdatedAt           time.Time    `json:"updated_at"`
+}
+
+// Admin Token 每日用量累计；阀门 daily_* 字段的真相源（CONTEXT.md throttle）
+type GatewayAdminTokenUsage struct {
+	TokenID int64 `json:"token_id"`
+	// UTC 当日；多时区业务系统看到的"今日"与配额"今日"可有 8h 偏差
+	Day pgtype.Date `json:"day"`
+	// 当日累计成功充值金额；仅 LedgerService outcome=FreshlyWritten 后累加
+	RechargeTotalMinor int64 `json:"recharge_total_minor"`
+	// 当日累计成功退款金额；同上语义
+	RefundTotalMinor int64 `json:"refund_total_minor"`
+	// 当日累计成功创建账户次数
+	AccountCreateCount int32     `json:"account_create_count"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // 异步任务：长耗时上游调用的本地记录（CONTEXT.md task）

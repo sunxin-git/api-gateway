@@ -26,11 +26,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
 
+	"github.com/sunxin-git/api-gateway/internal/admin"
+	"github.com/sunxin-git/api-gateway/internal/admintoken"
+	"github.com/sunxin-git/api-gateway/internal/audit"
 	"github.com/sunxin-git/api-gateway/internal/config"
 	"github.com/sunxin-git/api-gateway/internal/httpapi"
+	"github.com/sunxin-git/api-gateway/internal/httpapi/middleware"
 	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/obs"
 	"github.com/sunxin-git/api-gateway/internal/outbox"
@@ -133,7 +138,29 @@ func run() error {
 		Metrics:      metrics,
 	})
 
-	// 第 5 步：装配 HTTP server + 注册 /readyz 的 postgres 探针。
+	// 第 5 步：装配 Admin Token 鉴权 + 阀门 + 审计（D-min Unit 7 装配 5-9）。
+	adminTokenSvc := admintoken.NewPostgresService(pool, cfg.TokenPepperBytes, logger)
+	// CIDR 启动期 sweep：发现 ip_allowlist 异常的 token 立刻 bump metric 告警
+	sweepAdminTokenCIDRs(context.Background(), adminTokenSvc, metrics, logger)
+
+	instanceID := hostnameOrUnknown()
+	rpm := admintoken.NewInProcessRPM(logger, func() {
+		metrics.AdminThrottleRPMColdStartTotal.WithLabelValues(instanceID).Inc()
+	})
+	defer func() { _ = rpm.Close() }()
+	throttle := admintoken.NewPostgresThrottle(pool, rpm, logger)
+
+	auditLogger, auditCleanup, err := buildAuditLogger(cfg, logger)
+	if err != nil {
+		return fmt.Errorf("初始化 audit logger 失败: %w", err)
+	}
+	defer auditCleanup()
+
+	adminHandler := admin.NewHandler(ledgerSvc, throttle, &admin.Metrics{
+		IdempotencyConflictTotal: metrics.AdminAPIIdempotencyConflictTotal,
+	}, logger)
+
+	// 第 6 步：装配 HTTP server + 注册 /readyz 的 postgres 探针 + admin 路由组 + audit-health 探针。
 	srv := httpapi.NewServer(cfg, httpapi.Deps{
 		Logger:  logger,
 		Metrics: metrics,
@@ -143,17 +170,34 @@ func run() error {
 		// /readyz handler 内部已加 2s 超时；这里直接 Ping 即可。
 		return pool.Ping(ctx)
 	})
+	// audit-health：Tier1 sink 写失败累加后 readyz 关闸（计划 Unit 7 §1.5）。
+	srv.AddReadinessCheck("admin_audit_health", func(_ context.Context) error {
+		if hasAuditWriteFailure(metrics) {
+			return errors.New("admin audit Tier1 write failures present (see admin_audit_write_failed_total); 需重启进程恢复")
+		}
+		return nil
+	})
 
-	// 第 6 步：启动 ReconcilerController（goroutine + SIGUSR1 handler；Windows 是 no-op）。
+	// 第 7 步：注册 admin 路由组。
+	registerAdminRoutes(srv, adminHandler, adminTokenSvc, throttle, auditLogger, metrics)
+
+	// 第 8 步：启动 ReconcilerController（goroutine + SIGUSR1 handler；Windows 是 no-op）。
 	// parentCtx 用 Background：由 controller.Stop 终止，不依赖外部 signal ctx。
 	reconCtrl := ledger.NewReconcilerController(context.Background(), reconciler, logger, metrics)
 	reconCtrl.Start()
 
-	// 第 7 步：信号驱动的优雅停机。
+	// 第 9 步：信号驱动的优雅停机。
 	serverErr := make(chan error, 1)
 	go func() {
-		if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
+		var startErr error
+		if cfg.ListenTLS {
+			logger.Info("启动 TLS 监听", slog.String("cert", cfg.TLSCertPath))
+			startErr = srv.StartTLS(cfg.TLSCertPath, cfg.TLSKeyPath)
+		} else {
+			startErr = srv.Start()
+		}
+		if startErr != nil && !errors.Is(startErr, http.ErrServerClosed) {
+			serverErr <- startErr
 		}
 		close(serverErr)
 	}()
@@ -224,4 +268,169 @@ func newPGXPool(dsn string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("pool.Ping（DB 不可达）: %w", err)
 	}
 	return pool, nil
+}
+
+// =============================================================================
+// D-min Unit 7 helpers
+// =============================================================================
+
+// hostnameOrUnknown 取 os.Hostname；失败返 "unknown"。
+//
+// 用作 RPM cold-start metric 的 instance_id 标签；运维通过 dashboard 看到
+// 短期内多个 instance_id 的 cold-start spike 即 OOM / liveness 重启信号。
+func hostnameOrUnknown() string {
+	h, err := os.Hostname()
+	if err != nil || h == "" {
+		return "unknown"
+	}
+	return h
+}
+
+// sweepAdminTokenCIDRs 启动期扫所有活跃 Admin Token 的 ip_allowlist，
+// 发现损坏（解析失败 / 空数组）→ bump admin_token_corrupt_total + log critical。
+//
+// 不阻塞启动（这是诊断信号，不是 hard gate）；schema 已用 cidr[] 类型保证不应发生。
+func sweepAdminTokenCIDRs(ctx context.Context, svc *admintoken.PostgresService, m *obs.Metrics, log *slog.Logger) {
+	tokens, err := svc.List(ctx)
+	if err != nil {
+		log.Warn("启动期 admin token CIDR sweep 跳过（List 失败）",
+			slog.String("err", err.Error()))
+		return
+	}
+	for _, tok := range tokens {
+		if len(tok.AllowedCIDRs) == 0 {
+			log.Error("admin token ip_allowlist 为空（fail-closed：该 token 将拒绝所有请求）",
+				slog.Int64("token_id", tok.ID),
+				slog.String("description", tok.Description),
+			)
+			m.AdminTokenCorruptTotal.WithLabelValues(
+				int64ToLabel(tok.ID), "empty_cidr_list",
+			).Inc()
+			continue
+		}
+		// 防御性二次解析（pgx 已解析过；这里若失败说明类型库变了）
+		for _, p := range tok.AllowedCIDRs {
+			if !p.IsValid() {
+				log.Error("admin token ip_allowlist 含非法 CIDR（fail-closed）",
+					slog.Int64("token_id", tok.ID),
+					slog.String("cidr_repr", p.String()),
+				)
+				m.AdminTokenCorruptTotal.WithLabelValues(
+					int64ToLabel(tok.ID), "malformed_cidr",
+				).Inc()
+				break
+			}
+		}
+	}
+	log.Info("admin token CIDR sweep 完成", slog.Int("scanned", len(tokens)))
+}
+
+// buildAuditLogger 按 config 决定 Tier1/Tier2 sink 组合。
+//
+//   - GATEWAY_ENV=production：Tier1 SyncFileSink（必须）+ Tier2 AsyncStderrSink
+//   - 其他环境：path 设了走 SyncFileSink；未设走 AsyncStderrSink fallback for both
+//
+// 返回 cleanup func 必须 defer 调用。
+func buildAuditLogger(cfg *config.Config, log *slog.Logger) (audit.AuditLogger, func(), error) {
+	tier2 := audit.NewAsyncStderrSink()
+	var tier1 audit.Sink
+	if path := cfg.AdminAuditTier1Path; path != "" {
+		fs, err := audit.NewSyncFileSink(path)
+		if err != nil {
+			return nil, func() {}, fmt.Errorf("打开 audit Tier1 文件 %q: %w", path, err)
+		}
+		tier1 = fs
+		log.Info("audit Tier1 同步落盘", slog.String("path", path))
+	} else {
+		// dev/test fallback：Tier1 也走 stderr（无 fsync 保证；log warn 让运维知晓）
+		log.Warn("ADMIN_AUDIT_HIGH_VALUE_LOG_PATH 未设置，Tier1 fallback 到 stderr（无 fsync 保证）")
+		tier1 = tier2
+	}
+	logger := audit.NewLogger(tier1, tier2, log)
+	cleanup := func() { _ = logger.Close() }
+	return logger, cleanup, nil
+}
+
+// hasAuditWriteFailure 检查 admin_audit_write_failed_total 是否累加过。
+//
+// 实现：用 prometheus.Gather 读 CounterVec 所有 child 值；任一 > 0 即视为失败。
+// 不缓存：每次 /readyz 调用都现读，保证最新状态。
+func hasAuditWriteFailure(m *obs.Metrics) bool {
+	mfs, err := m.Registry.Gather()
+	if err != nil {
+		return false // 读 metric 失败时不关闸（避免次级故障扩散）
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "gateway_admin_audit_write_failed_total" {
+			continue
+		}
+		for _, child := range mf.GetMetric() {
+			if child.Counter != nil && child.Counter.GetValue() > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// registerAdminRoutes 把 admin handler 5 个 endpoint 挂在 /admin/v1 路由组下，
+// 装好完整 5 件套中间件链 + HSTS。
+//
+// 链顺序（plan Unit 4）：
+//
+//	HSTS → AdminBodyLimit → AdminTokenAuth → AdminThrottle →
+//	  AdminScope(handler-specific) → AdminAudit → handler
+func registerAdminRoutes(
+	srv *httpapi.Server,
+	h *admin.Handler,
+	tokenSvc admintoken.Service,
+	thr admintoken.Throttle,
+	auditLogger audit.AuditLogger,
+	m *obs.Metrics,
+) {
+	g := srv.Engine().Group("/admin/v1")
+	g.Use(
+		middleware.HSTS(),
+		middleware.AdminBodyLimit(m.AdminAPIBodyTooLargeTotal),
+		middleware.AdminTokenAuth(tokenSvc, m.AdminAPIAuthFailedTotal),
+		middleware.AdminThrottle(thr, m.AdminAPIQuotaExceededTotal),
+	)
+
+	scope := func(name string) gin.HandlerFunc {
+		return middleware.AdminScope(tokenSvc, name, m.AdminAPIAuthFailedTotal)
+	}
+
+	g.POST("/business-accounts",
+		scope("business_account:create"),
+		middleware.AdminAudit(auditLogger, thr, m.AdminAuditWriteFailedTotal),
+		h.CreateAccount,
+	)
+	g.POST("/business-accounts/:id/recharge",
+		scope("business_account:recharge"),
+		middleware.AdminAudit(auditLogger, thr, m.AdminAuditWriteFailedTotal),
+		h.Recharge,
+	)
+	g.POST("/business-accounts/:id/refund",
+		scope("business_account:refund"),
+		middleware.AdminAudit(auditLogger, thr, m.AdminAuditWriteFailedTotal),
+		h.Refund,
+	)
+	g.GET("/business-accounts/:id/balance",
+		scope("business_account:read"),
+		middleware.AdminAudit(auditLogger, thr, m.AdminAuditWriteFailedTotal),
+		h.GetBalance,
+	)
+	// whoami 无需 scope；任一已鉴权 token 可调
+	g.GET("/whoami",
+		middleware.AdminAudit(auditLogger, thr, m.AdminAuditWriteFailedTotal),
+		h.Whoami,
+	)
+}
+
+// int64ToLabel int64 → metric label 字符串。
+func int64ToLabel(n int64) string {
+	if n == 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d", n)
 }

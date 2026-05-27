@@ -36,9 +36,14 @@ type Querier interface {
 	CreateBusinessAccount(ctx context.Context, arg CreateBusinessAccountParams) (BusinessAccount, error)
 	// 创建账户的零值 balance 行（与 CreateBusinessAccount 同事务）。
 	CreateBusinessAccountBalanceZero(ctx context.Context, businessAccountID string) (BusinessAccountBalance, error)
+	// 鉴权热路径：根据 token_hash 单 query 查活跃 token（未 revoke + 未过期）。
+	// service 层调用前先算 hex = hex.EncodeToString(HMAC-SHA-256(pepper, plaintext))。
+	FindActiveAdminTokenByHash(ctx context.Context, tokenHash string) (FindActiveAdminTokenByHashRow, error)
 	// Commit/Release 前置校验：找同 correlation_id 的 active reserve（未 commit / release）。
 	// NOT EXISTS 子查询确认同 correlation_id 没有 commit/release entry。
 	FindActiveReserveByCorrelation(ctx context.Context, arg FindActiveReserveByCorrelationParams) (FindActiveReserveByCorrelationRow, error)
+	// 按 id 查 token（不限制是否 revoked / expired，运维查询用）。
+	FindAdminTokenByID(ctx context.Context, id int64) (FindAdminTokenByIDRow, error)
 	// 用于区分「未找到 reserve」与「reserve 已 commit/release」（service 用以返回不同 sentinel）。
 	FindAnyReserveByCorrelation(ctx context.Context, arg FindAnyReserveByCorrelationParams) (FindAnyReserveByCorrelationRow, error)
 	// 通用反查：Reserve/Commit/Release/Refund 幂等用此 query 检查同 correlation_id+entry_type 是否已存在。
@@ -68,18 +73,54 @@ type Querier interface {
 	// 入口校验：仅返回 status + isolation_required，避免拉全字段；
 	// service 层在写操作入口先调用此 query 判 status='active'。
 	GetBusinessAccountForActiveCheck(ctx context.Context, id string) (GetBusinessAccountForActiveCheckRow, error)
+	// 查熔断器状态；middleware 在 CheckCircuitBreaker 时调用。
+	// 不存在 token_id 时返 0 rows（service 视作未熔断）。
+	GetCircuitState(ctx context.Context, tokenID int64) (GetCircuitStateRow, error)
 	// ============================================================================
 	// 4. rebuild 全量读
 	// ============================================================================
 	// rebuild TX2 用：按 id ASC 全量取 ledger，应用层累加得 expected balance。
 	// ORDER BY id 保证回放顺序与原写入顺序一致（虽然累加是可交换的，方便审计）。
 	GetLedgerEntriesForRebuild(ctx context.Context, businessAccountID string) ([]GetLedgerEntriesForRebuildRow, error)
+	// 查指定 token 当日用量；不存在则返 0 rows（service 层视作 0 用量）。
+	// day 同样按 UTC（与累加 query 对齐）。
+	GetTokenUsage(ctx context.Context, tokenID int64) (GatewayAdminTokenUsage, error)
+	// ============================================================================
+	// 2. Token 每日用量累计
+	// ============================================================================
+	// 单语句原子累加当日用量；不存在则 INSERT，存在则 UPDATE 累加。
+	// 三列分别累加（recharge / refund / create）；调用方按场景传非零的那一列，其他传 0。
+	// day 用 UTC 当日（决策 D9）。
+	IncrementTokenUsage(ctx context.Context, arg IncrementTokenUsageParams) (GatewayAdminTokenUsage, error)
+	// admin_token.sql —— Admin Token CRUD + 阀门用量累计 + 熔断器状态机
+	//
+	// 设计文档：docs/multimedia-gateway-design.md §9bis.6（Admin Token 安全 5 件套）
+	// 实施计划：docs/plans/2026-05-27-003-feat-workflow-d-min-admin-api-plan.md Unit 1
+	//
+	// 命名约定：
+	//   - InsertAdminToken / FindActiveAdminTokenByHash / RevokeAdminToken / ListActiveAdminTokens：token CRUD
+	//   - IncrementTokenUsage / GetTokenUsage：每日用量累计 + 查询
+	//   - RecordCircuitError / TripCircuitBreaker / GetCircuitState / ResetCircuitBreaker：熔断器状态机
+	//
+	// 关键 PG 语义：
+	//   - ON CONFLICT DO UPDATE：用于 UPSERT 同行原子累加，行锁串行化保证 100+ 并发同行无丢失
+	//   - COALESCE(revoked_at, NOW())：Revoke 同 token 多次时保留首次 revoke 时间戳，幂等成功
+	//   - CASE WHEN 在 DO UPDATE SET 子句中：实现 circuit 1h 滚动窗口的"超时即重置"
+	// ============================================================================
+	// 1. Admin Token CRUD
+	// ============================================================================
+	// 插入新 Admin Token；调用方负责生成 plaintext + HMAC-SHA-256(pepper, plaintext) → token_hash hex。
+	// 7 个阀门字段 NULL = 无限制；ip_allowlist 至少 1 个 CIDR（service 层校验，schema 不强制）。
+	InsertAdminToken(ctx context.Context, arg InsertAdminTokenParams) (InsertAdminTokenRow, error)
 	// outbox.sql —— webhook_event_outbox 写路径
 	//
 	// 本工作流仅实现 INSERT；dispatcher（claim/lease 抢占 + 推送 + DLQ）由 C-min 落地。
 	// 同事务 INSERT outbox event；retention_until / is_financial / delivery_idempotency_key 由调用方算好。
 	// delivery_status 默认 'pending'，等待 dispatcher 扫描。
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (WebhookEventOutbox, error)
+	// 列出所有活跃 token（未 revoke）；按 created_at DESC 排序便于运维查最新发放。
+	// 返回**不含** token_hash（避免泄漏；明文已无法获取，hash 也只入审计 / 排查路径）。
+	ListActiveAdminTokens(ctx context.Context) ([]ListActiveAdminTokensRow, error)
 	// reconciler 全表扫起点：仅取 ID + 当前 version；后续读 SUM 时再单只读 tx 中拉一致快照。
 	ListAllUnfrozenAccountsForReconciler(ctx context.Context) ([]ListAllUnfrozenAccountsForReconcilerRow, error)
 	// reconciler 收尾 watchdog：扫出处于 rebuild_in_progress 状态且 frozen 时间过长的账户。
@@ -117,6 +158,16 @@ type Querier interface {
 	// 充值：available 增 + recharge_total 增；CAS WHERE frozen=false AND version=?
 	// 0 行 = CAS 失败（frozen / version 冲突）；service 同 tx 内 fresh-read 判错。
 	RechargeAtomic(ctx context.Context, arg RechargeAtomicParams) (RechargeAtomicRow, error)
+	// ============================================================================
+	// 3. 熔断器状态机
+	// ============================================================================
+	// 错误计数 + 1h 滚动窗口自动重置（document-review feasibility #8 完整 SQL）。
+	// 行为：
+	//   - 不存在 token_id → INSERT (window_started_at=NOW(), error_count=1)
+	//   - 存在但 window_started_at < NOW() - 1h → 重置窗口（error_count=1, window_started_at=NOW()）
+	//   - 存在且窗口内 → error_count + 1
+	// 单语句完成所有路径，行锁串行化保证 50+ 并发同 token error_count 最终 = 实际错误数。
+	RecordCircuitError(ctx context.Context, tokenID int64) (RecordCircuitErrorRow, error)
 	// 退款：used_total 减 + available 增 + refund_total 增；CAS 含 used_total >= @amount AND version=?
 	// 不查 frozen（管理动作允许）。refund_total 不进不变量等式，单独自增。
 	RefundAtomic(ctx context.Context, arg RefundAtomicParams) (RefundAtomicRow, error)
@@ -130,6 +181,14 @@ type Querier interface {
 	// 预占：available 减 + reserved 增；CAS 含 available >= @amount AND frozen=false AND version=?
 	// available_delta 用 (0::bigint - @amount)::bigint 表达负值（sqlc 解析必须）。
 	ReserveAtomic(ctx context.Context, arg ReserveAtomicParams) (ReserveAtomicRow, error)
+	// 运维手工解锁熔断器（admin-cli circuit-reset 推 P1）。
+	// 重置 error_count 与 window，清 breaker_tripped_until。
+	ResetCircuitBreaker(ctx context.Context, tokenID int64) (ResetCircuitBreakerRow, error)
+	// Revoke 给定 id 的 token。
+	// 用 COALESCE(revoked_at, NOW()) 保留首次 revoke 时间戳，多次 Revoke 同 id 不覆盖原 timestamp。
+	// 返回值（id + 新 revoked_at + 原 revoked_at）让 service 区分"首次 revoke" vs "已 revoked 幂等"。
+	// 不存在 id 时返 0 rows（service 层判 ErrTokenNotFound）。
+	RevokeAdminToken(ctx context.Context, id int64) (RevokeAdminTokenRow, error)
 	// ============================================================================
 	// 3. drift reconciler 聚合
 	// ============================================================================
@@ -137,6 +196,9 @@ type Querier interface {
 	// 与 balance 表比对得 drift。recharge_sum / refund_sum 用 FILTER 仅累加对应 entry_type。
 	// COALESCE 兜底 NULL（账户 0 条 ledger 时 SUM 返回 NULL）。
 	SumLedgerDeltasByAccount(ctx context.Context, businessAccountID string) (SumLedgerDeltasByAccountRow, error)
+	// 跳闸：把 breaker_tripped_until 写为 NOW() + 1h；service 在 RecordCircuitError 返 error_count ≥ 100 时调。
+	// 已跳闸 token 重复调用：tripped_until 取较大值（不会缩短跳闸期）。
+	TripCircuitBreaker(ctx context.Context, tokenID int64) (TripCircuitBreakerRow, error)
 	// 解冻：CAS 含 frozen=true AND version=?；frozen_reason 重写为新值（rebuild_completed / manual_unfreeze）。
 	// 0 行 = 已 unfrozen（幂等成功）或 version 冲突。
 	UnfreezeAtomic(ctx context.Context, arg UnfreezeAtomicParams) (BusinessAccountBalance, error)
