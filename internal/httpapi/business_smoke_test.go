@@ -53,7 +53,7 @@ func (fakeBizKeyService) ValidateByPlaintext(_ context.Context, plaintext string
 	return nil, businesskey.ErrKeyNotFound
 }
 
-func (fakeBizKeyService) Revoke(_ context.Context, _ int64) (bool, error)              { return false, nil }
+func (fakeBizKeyService) Revoke(_ context.Context, _ int64) (bool, error) { return false, nil }
 func (fakeBizKeyService) ListByAccount(_ context.Context, _ string) ([]*businesskey.Key, error) {
 	return nil, nil
 }

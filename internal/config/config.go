@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"os"
 	"strings"
@@ -164,12 +165,12 @@ func Load(envFilePath string) (*Config, error) {
 
 	// 第 1 步：默认值。
 	defaults := map[string]any{
-		keyHTTPAddr:           ":8080",
-		keyLogLevel:           "info",
-		keyRedisAddr:          "localhost:6379",
-		keyOTelExporter:       "stdout",
-		keyCORSAllowedOrigins: "",
-		keyLedgerDriftAction:  "log",
+		keyHTTPAddr:                  ":8080",
+		keyLogLevel:                  "info",
+		keyRedisAddr:                 "localhost:6379",
+		keyOTelExporter:              "stdout",
+		keyCORSAllowedOrigins:        "",
+		keyLedgerDriftAction:         "log",
 		keyGatewayEnv:                EnvDev, // 默认 dev；production 必须显式设置
 		keyTrustedProxyCIDRs:         "",
 		keyListenTLS:                 "false",
@@ -212,6 +213,13 @@ func Load(envFilePath string) (*Config, error) {
 		return nil, fmt.Errorf("加载环境变量失败: %w", err)
 	}
 
+	// RelayMaxContextTokens int64→int32：越界置 math.MaxInt32（catalog 限 [1, 1e6] 会拒），
+	// 防止截断把超大值 wrap 成看似合法的小值绕过 relay.NewEnvCatalog 范围校验。
+	relayMaxCtx := k.Int64(keyRelayMaxContextTokens)
+	if relayMaxCtx < 0 || relayMaxCtx > math.MaxInt32 {
+		relayMaxCtx = math.MaxInt32
+	}
+
 	cfg := &Config{
 		HTTPAddr:             k.String(keyHTTPAddr),
 		LogLevel:             k.String(keyLogLevel),
@@ -239,7 +247,7 @@ func Load(envFilePath string) (*Config, error) {
 		RelayUpstreamModelName:     k.String(keyRelayUpstreamModelName),
 		RelayPriceInputPer1MMinor:  k.Int64(keyRelayPriceInputPer1MMinor),
 		RelayPriceOutputPer1MMinor: k.Int64(keyRelayPriceOutputPer1MMinor),
-		RelayMaxContextTokens:      int32(k.Int64(keyRelayMaxContextTokens)),
+		RelayMaxContextTokens:      int32(relayMaxCtx),
 	}
 
 	if err := cfg.validate(); err != nil {
