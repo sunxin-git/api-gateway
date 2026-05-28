@@ -20,6 +20,10 @@ type CatalogConfig struct {
 	PriceInputPer1MMinor  int64
 	PriceOutputPer1MMinor int64
 	MaxContextTokens      int32
+
+	// RequireHTTPS production 模式强制上游 base url scheme = https（防明文上游连接泄露凭据）。
+	// main.go 装配时设 = (cfg.GatewayEnv == production)；dev / test 允许 http（本地 mock）。
+	RequireHTTPS bool
 }
 
 // Catalog model 字典接口（plan §Unit 3 Approach）。
@@ -139,6 +143,12 @@ func validateCatalogConfig(cfg CatalogConfig) error {
 	}
 	if u.Host == "" {
 		return fmt.Errorf("relay catalog: UpstreamBaseURL 缺 host: %q", cfg.UpstreamBaseURL)
+	}
+	if cfg.RequireHTTPS && u.Scheme != "https" {
+		return fmt.Errorf(
+			"relay catalog: production 模式 UpstreamBaseURL 必须 https（防明文上游连接泄露凭据；当前 %q）",
+			u.Scheme,
+		)
 	}
 	if strings.TrimSpace(cfg.UpstreamAPIKey) == "" {
 		return errors.New("relay catalog: UpstreamAPIKey 不能为空")

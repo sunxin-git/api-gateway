@@ -96,10 +96,27 @@ func TestNewEnvCatalog_FailFastMatrix(t *testing.T) {
 }
 
 func TestEnvCatalog_HTTPBaseURLAllowedForDev(t *testing.T) {
-	// dev 模式允许 http upstream（如本地 mock）；catalog 层不强制 https
-	// （production https 强制由 config 层校验，plan §决策 D11）
+	// dev 模式（RequireHTTPS=false）允许 http upstream（如本地 mock）
 	cfg := validCatalogConfig()
 	cfg.UpstreamBaseURL = "http://localhost:11434/v1"
+	_, err := NewEnvCatalog(cfg)
+	require.NoError(t, err)
+}
+
+func TestEnvCatalog_RequireHTTPS_RejectsHTTP(t *testing.T) {
+	// production 模式（RequireHTTPS=true）拒绝 http upstream
+	cfg := validCatalogConfig()
+	cfg.UpstreamBaseURL = "http://ark.example.com/v1"
+	cfg.RequireHTTPS = true
+	_, err := NewEnvCatalog(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "https")
+}
+
+func TestEnvCatalog_RequireHTTPS_AcceptsHTTPS(t *testing.T) {
+	cfg := validCatalogConfig()
+	cfg.UpstreamBaseURL = "https://ark.cn-beijing.volces.com/api/v3"
+	cfg.RequireHTTPS = true
 	_, err := NewEnvCatalog(cfg)
 	require.NoError(t, err)
 }

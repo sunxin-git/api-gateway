@@ -93,6 +93,42 @@ type Metrics struct {
 	// 标签：instance_id（main.go 装配时填 hostname / pod name；为空填 "unknown"）。
 	// 让运维通过短期内 spike 识别"OOM 重启 / liveness 循环重启绕 RPM"信号。
 	AdminThrottleRPMColdStartTotal *prometheus.CounterVec
+
+	// ===== Phase 2 工作流 F-min（Unit 7）：Relay 业务路由指标 =====
+
+	// RelayRequestTotal 每次 relay 完成记一次（含成功 / 失败 / 上游 4xx 等所有路径）。
+	// 标签：model（gateway model name）、upstream_status（"200"/"4xx"/"5xx"/"upstream_timeout"/...）。
+	RelayRequestTotal *prometheus.CounterVec
+
+	// RelayReserveFailedTotal Reserve 阶段失败计数。
+	// 标签：reason（insufficient_balance / account_frozen / account_not_found / version_conflict / internal）。
+	RelayReserveFailedTotal *prometheus.CounterVec
+
+	// RelaySettleFailedTotal Commit / Release 永久失败计数（3 次重试仍失败 → orphan reserve 信号）。
+	// 标签：phase（commit / release）、reason（version_conflict / timeout / internal）。
+	RelaySettleFailedTotal *prometheus.CounterVec
+
+	// RelayTokenCostMinor 累计计费（minor unit）；业务对账用。标签：model。
+	RelayTokenCostMinor *prometheus.CounterVec
+
+	// RelayUpstreamDuration 上游 HTTP 请求端到端耗时（秒）。标签：model、status。
+	RelayUpstreamDuration *prometheus.HistogramVec
+
+	// RelayUpstreamMissingUsage 上游返 200 但缺 usage 字段次数（兜底 commit reserve 信号）。标签：model。
+	RelayUpstreamMissingUsage *prometheus.CounterVec
+
+	// BusinessAPIAuthFailedTotal 业务侧鉴权失败计数。
+	// 标签：reason（missing_header / bad_scheme / empty_token / invalid_api_key / internal_error）。
+	BusinessAPIAuthFailedTotal *prometheus.CounterVec
+
+	// BusinessAPIRateLimitedTotal 业务侧 RPM 限速触发次数。标签：key_id。
+	BusinessAPIRateLimitedTotal *prometheus.CounterVec
+
+	// BusinessAPIBodyTooLargeTotal 业务请求体超 1 MiB 拒绝次数（pre-auth；无 label）。
+	BusinessAPIBodyTooLargeTotal prometheus.Counter
+
+	// BusinessThrottleRPMColdStartTotal 业务侧 InProcessRPM 冷启次数（每次进程启动 +1）。标签：instance_id。
+	BusinessThrottleRPMColdStartTotal *prometheus.CounterVec
 }
 
 // NewMetrics 构造并注册所有指标。version/commit 通常通过 ldflags 注入；Phase 1 写 "dev"。
@@ -245,6 +281,79 @@ func NewMetrics(version, commit string) *Metrics {
 		[]string{"instance_id"},
 	)
 
+	// ===== F-min Unit 7 relay / business_api 指标 =====
+
+	relayRequest := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_relay_request_total",
+			Help: "Relay 请求完成计数（含成功 / 上游 4xx/5xx / timeout / unreachable / malformed）",
+		},
+		[]string{"model", "upstream_status"},
+	)
+	relayReserveFailed := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_relay_reserve_failed_total",
+			Help: "Relay Reserve 阶段失败计数（insufficient_balance / account_frozen / account_not_found / version_conflict / internal）",
+		},
+		[]string{"reason"},
+	)
+	relaySettleFailed := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_relay_settle_failed_total",
+			Help: "Relay Commit/Release 永久失败计数（3 次重试仍失败 → orphan reserve 信号）",
+		},
+		[]string{"phase", "reason"},
+	)
+	relayTokenCost := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_relay_token_cost_minor_total",
+			Help: "Relay 累计计费（minor unit / CNY 分）；业务对账用",
+		},
+		[]string{"model"},
+	)
+	relayUpstreamDur := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "gateway_relay_upstream_duration_seconds",
+			Help:    "上游 HTTP 请求端到端耗时（秒）",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60},
+		},
+		[]string{"model", "status"},
+	)
+	relayUpstreamMissingUsage := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_relay_upstream_missing_usage_total",
+			Help: "上游返 200 但缺 usage 字段次数；触发兜底 commit reserve（provider 协议异常信号）",
+		},
+		[]string{"model"},
+	)
+	businessAuthFailed := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_business_api_auth_failed_total",
+			Help: "业务 API 鉴权失败计数（missing_header / bad_scheme / empty_token / invalid_api_key / internal_error）",
+		},
+		[]string{"reason"},
+	)
+	businessRateLimited := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_business_api_rate_limited_total",
+			Help: "业务 API RPM 限速触发次数",
+		},
+		[]string{"key_id"},
+	)
+	businessBodyTooLarge := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gateway_business_api_body_too_large_total",
+			Help: "业务请求体超 1 MiB 拒绝次数（pre-auth；无 label）",
+		},
+	)
+	businessRPMColdStart := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_business_throttle_rpm_cold_start_total",
+			Help: "业务 InProcessRPM 冷启次数（每次进程启动 +1）",
+		},
+		[]string{"instance_id"},
+	)
+
 	reg.MustRegister(
 		httpReqDur, buildInfo, panicTotal,
 		driftTotal, driftFalsePositive,
@@ -253,6 +362,10 @@ func NewMetrics(version, commit string) *Metrics {
 		adminQuotaExceeded, adminAuthFailed, adminBodyTooLarge,
 		adminIdempConflict, adminXFFRejected, adminAuditWriteFailed,
 		adminTokenCorrupt, adminRPMColdStart,
+		relayRequest, relayReserveFailed, relaySettleFailed,
+		relayTokenCost, relayUpstreamDur, relayUpstreamMissingUsage,
+		businessAuthFailed, businessRateLimited, businessBodyTooLarge,
+		businessRPMColdStart,
 	)
 
 	return &Metrics{
@@ -276,5 +389,17 @@ func NewMetrics(version, commit string) *Metrics {
 		AdminAuditWriteFailedTotal:       adminAuditWriteFailed,
 		AdminTokenCorruptTotal:           adminTokenCorrupt,
 		AdminThrottleRPMColdStartTotal:   adminRPMColdStart,
+
+		RelayRequestTotal:         relayRequest,
+		RelayReserveFailedTotal:   relayReserveFailed,
+		RelaySettleFailedTotal:    relaySettleFailed,
+		RelayTokenCostMinor:       relayTokenCost,
+		RelayUpstreamDuration:     relayUpstreamDur,
+		RelayUpstreamMissingUsage: relayUpstreamMissingUsage,
+
+		BusinessAPIAuthFailedTotal:        businessAuthFailed,
+		BusinessAPIRateLimitedTotal:       businessRateLimited,
+		BusinessAPIBodyTooLargeTotal:      businessBodyTooLarge,
+		BusinessThrottleRPMColdStartTotal: businessRPMColdStart,
 	}
 }

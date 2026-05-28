@@ -47,6 +47,19 @@ const (
 	keyTLSKeyPath          = "gateway_tls_key_path"
 	keyTokenPepper         = "gateway_token_pepper"
 	keyAdminAuditTier1Path = "admin_audit_high_value_log_path"
+
+	// F-min Unit 7 新增（relay 业务路由 /v1 配置）。
+	// RelayEnabled=false（默认）时 /v1 路由不注册（admin-only 部署）；
+	// =true 时 8 个 RELAY_* 字段经 relay.NewEnvCatalog fail-fast 校验（main.go 装配时）。
+	keyRelayEnabled               = "gateway_relay_enabled"
+	keyRelayModelName             = "gateway_relay_model_name"
+	keyRelayUpstreamProviderType  = "gateway_relay_upstream_provider_type"
+	keyRelayUpstreamBaseURL       = "gateway_relay_upstream_base_url"
+	keyRelayUpstreamAPIKey        = "gateway_relay_upstream_api_key"
+	keyRelayUpstreamModelName     = "gateway_relay_upstream_model_name"
+	keyRelayPriceInputPer1MMinor  = "gateway_relay_price_input_per_1m_minor"
+	keyRelayPriceOutputPer1MMinor = "gateway_relay_price_output_per_1m_minor"
+	keyRelayMaxContextTokens      = "gateway_relay_max_context_tokens"
 )
 
 // 环境模式常量。
@@ -117,6 +130,29 @@ type Config struct {
 	// AdminAuditTier1Path Tier1（refund / token lifecycle / 401 / idempotency_conflict）
 	// 同步审计日志文件路径。production 强制有值；dev 可空（dev 不写 Tier1 文件）。
 	AdminAuditTier1Path string
+
+	// ===== F-min Unit 7 新增（relay 业务路由 /v1 配置） =====
+
+	// RelayEnabled 是否启用 relay 业务路由 /v1/chat/completions（默认 false = admin-only 部署）。
+	// =true 时 main.go 用以下 8 个 Relay* 字段构造 relay.EnvCatalog（fail-fast 校验在
+	// relay.NewEnvCatalog 内，避免与 config 重复校验）。
+	RelayEnabled bool
+
+	// RelayModelName 业务可见 model 名（如 "gw-default"）。
+	RelayModelName string
+	// RelayUpstreamProviderType provider 协议簇；MVP 唯一 "openai_compat"。
+	RelayUpstreamProviderType string
+	// RelayUpstreamBaseURL 上游 base url（不含 /chat/completions）；production 强制 https。
+	RelayUpstreamBaseURL string
+	// RelayUpstreamAPIKey 上游凭据（MVP env 明文；P1 envelope encryption）。
+	RelayUpstreamAPIKey string
+	// RelayUpstreamModelName 上游真实 model 名（如 "doubao-1-5-pro-32k-250115"）。
+	RelayUpstreamModelName string
+	// RelayPriceInputPer1MMinor / RelayPriceOutputPer1MMinor input/output token 单价（每 1M token，minor / CNY 分）。
+	RelayPriceInputPer1MMinor  int64
+	RelayPriceOutputPer1MMinor int64
+	// RelayMaxContextTokens 字典默认 max context（业务可传更小 max_tokens）。
+	RelayMaxContextTokens int32
 }
 
 // Load 加载并校验配置。
@@ -134,10 +170,12 @@ func Load(envFilePath string) (*Config, error) {
 		keyOTelExporter:       "stdout",
 		keyCORSAllowedOrigins: "",
 		keyLedgerDriftAction:  "log",
-		keyGatewayEnv:         EnvDev, // 默认 dev；production 必须显式设置
-		keyTrustedProxyCIDRs:  "",
-		keyListenTLS:          "false",
-		keyFrontTLSAck:        "false",
+		keyGatewayEnv:                EnvDev, // 默认 dev；production 必须显式设置
+		keyTrustedProxyCIDRs:         "",
+		keyListenTLS:                 "false",
+		keyFrontTLSAck:               "false",
+		keyRelayEnabled:              "false", // 默认 admin-only；显式 =true 开启 /v1 relay
+		keyRelayUpstreamProviderType: "openai_compat",
 	}
 	if err := k.Load(mapProvider(defaults), nil); err != nil {
 		return nil, fmt.Errorf("加载默认值失败: %w", err)
@@ -192,6 +230,16 @@ func Load(envFilePath string) (*Config, error) {
 		TLSKeyPath:           k.String(keyTLSKeyPath),
 		TokenPepper:          k.String(keyTokenPepper),
 		AdminAuditTier1Path:  k.String(keyAdminAuditTier1Path),
+
+		RelayEnabled:               k.Bool(keyRelayEnabled),
+		RelayModelName:             k.String(keyRelayModelName),
+		RelayUpstreamProviderType:  k.String(keyRelayUpstreamProviderType),
+		RelayUpstreamBaseURL:       k.String(keyRelayUpstreamBaseURL),
+		RelayUpstreamAPIKey:        k.String(keyRelayUpstreamAPIKey),
+		RelayUpstreamModelName:     k.String(keyRelayUpstreamModelName),
+		RelayPriceInputPer1MMinor:  k.Int64(keyRelayPriceInputPer1MMinor),
+		RelayPriceOutputPer1MMinor: k.Int64(keyRelayPriceOutputPer1MMinor),
+		RelayMaxContextTokens:      int32(k.Int64(keyRelayMaxContextTokens)),
 	}
 
 	if err := cfg.validate(); err != nil {
