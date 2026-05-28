@@ -35,6 +35,7 @@ Phase 1 阶段本工具仅暴露子命令骨架，所有子命令均会返回「
 	root.AddCommand(
 		newMigrateCmd(),
 		newTokenCmd(),
+		newBusinessKeyCmd(),
 		newAccountCmd(),
 		newDriftCheckCmd(),
 	)
