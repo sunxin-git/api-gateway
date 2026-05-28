@@ -33,12 +33,14 @@ import (
 	"github.com/sunxin-git/api-gateway/internal/admin"
 	"github.com/sunxin-git/api-gateway/internal/admintoken"
 	"github.com/sunxin-git/api-gateway/internal/audit"
+	"github.com/sunxin-git/api-gateway/internal/businesskey"
 	"github.com/sunxin-git/api-gateway/internal/config"
 	"github.com/sunxin-git/api-gateway/internal/httpapi"
 	"github.com/sunxin-git/api-gateway/internal/httpapi/middleware"
 	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/obs"
 	"github.com/sunxin-git/api-gateway/internal/outbox"
+	"github.com/sunxin-git/api-gateway/internal/relay"
 )
 
 // 通过 ldflags 注入；Phase 1 默认值。
@@ -64,6 +66,9 @@ const (
 	dbPingTimeout = 5 * time.Second
 	// shutdownTimeout HTTP graceful shutdown 总预算。
 	shutdownTimeout = 30 * time.Second
+	// upstreamHTTPTimeout relay 调上游 chat completions 的客户端总超时（plan §决策 D2）。
+	// 同步非流式场景 60s 足够；超时 → ErrUpstreamTimeout → Release reserve + 504。
+	upstreamHTTPTimeout = 60 * time.Second
 )
 
 func main() {
@@ -180,6 +185,32 @@ func run() error {
 
 	// 第 7 步：注册 admin 路由组。
 	registerAdminRoutes(srv, adminHandler, adminTokenSvc, throttle, auditLogger, metrics)
+
+	// 第 7bis 步：装配 + 注册业务 relay 路由组 /v1（仅 RelayEnabled=true 时）。
+	// admin-only 部署（RelayEnabled=false）跳过：不构造 businesskey / catalog / adapter，
+	// /v1 不存在（业务请求 404）。fail-fast：catalog 校验失败拒启动。
+	if cfg.RelayEnabled {
+		bizKeySvc := businesskey.NewPostgresService(pool, cfg.TokenPepperBytes, logger)
+		defer func() { _ = bizKeySvc.Close() }()
+
+		bizRPM := businesskey.NewInProcessRPM(logger, func() {
+			metrics.BusinessThrottleRPMColdStartTotal.WithLabelValues(instanceID).Inc()
+		})
+		defer func() { _ = bizRPM.Close() }()
+
+		relayHandler, err := buildRelayHandler(cfg, ledgerSvc, metrics, logger)
+		if err != nil {
+			return fmt.Errorf("装配 relay handler 失败: %w", err)
+		}
+		registerBusinessRoutes(srv, relayHandler, bizKeySvc, bizRPM, auditLogger, metrics)
+		logger.Info("业务 relay 路由已注册",
+			slog.String("path", "/v1/chat/completions"),
+			slog.String("gateway_model", cfg.RelayModelName),
+			slog.String("upstream_provider", cfg.RelayUpstreamProviderType),
+		)
+	} else {
+		logger.Info("RelayEnabled=false：admin-only 部署，/v1 业务路由未注册")
+	}
 
 	// 第 8 步：启动 ReconcilerController（goroutine + SIGUSR1 handler；Windows 是 no-op）。
 	// parentCtx 用 Background：由 controller.Stop 终止，不依赖外部 signal ctx。
@@ -433,4 +464,72 @@ func int64ToLabel(n int64) string {
 		return "unknown"
 	}
 	return fmt.Sprintf("%d", n)
+}
+
+// =============================================================================
+// F-min Unit 7 helpers（业务 relay 装配）
+// =============================================================================
+
+// buildRelayHandler 构造 relay catalog + adapter + handler（plan §Unit 7 装配）。
+//
+//   - catalog：EnvCatalog 单条；RequireHTTPS = (production)；校验失败 fail-fast
+//   - upstream client：标准库 net/http，60s 总超时（无第三方依赖，CLAUDE.md §三）
+//   - adapter：OpenAI 兼容（MVP 唯一）
+//   - HandlerMetrics：从 obs.Metrics 抽 relay 子集注入（解耦 relay 不 import obs）
+func buildRelayHandler(cfg *config.Config, l ledger.Service, m *obs.Metrics, log *slog.Logger) (*relay.RelayHandler, error) {
+	catalog, err := relay.NewEnvCatalog(relay.CatalogConfig{
+		ModelName:             cfg.RelayModelName,
+		UpstreamProviderType:  cfg.RelayUpstreamProviderType,
+		UpstreamBaseURL:       cfg.RelayUpstreamBaseURL,
+		UpstreamAPIKey:        cfg.RelayUpstreamAPIKey,
+		UpstreamModelName:     cfg.RelayUpstreamModelName,
+		PriceInputPer1MMinor:  cfg.RelayPriceInputPer1MMinor,
+		PriceOutputPer1MMinor: cfg.RelayPriceOutputPer1MMinor,
+		MaxContextTokens:      cfg.RelayMaxContextTokens,
+		RequireHTTPS:          cfg.GatewayEnv == config.EnvProduction,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	upstreamClient := &http.Client{Timeout: upstreamHTTPTimeout}
+	adapter := relay.NewOpenAICompatAdapter(upstreamClient)
+
+	handlerMetrics := &relay.HandlerMetrics{
+		RequestTotal:         m.RelayRequestTotal,
+		ReserveFailedTotal:   m.RelayReserveFailedTotal,
+		SettleFailedTotal:    m.RelaySettleFailedTotal,
+		TokenCostMinor:       m.RelayTokenCostMinor,
+		UpstreamDuration:     m.RelayUpstreamDuration,
+		UpstreamMissingUsage: m.RelayUpstreamMissingUsage,
+	}
+
+	return relay.NewRelayHandler(catalog, adapter, l, handlerMetrics, log), nil
+}
+
+// registerBusinessRoutes 把业务 relay endpoint 挂在 /v1 路由组下，装好业务中间件链。
+//
+// 链顺序（plan §Unit 4 业务链）：
+//
+//	HSTS → BusinessBodyLimit(1MiB) → BusinessKeyAuth → BusinessRPM → BusinessAudit → handler
+//
+// 与 admin 链对称：BodyLimit 在鉴权前（pre-auth 拒绝超大 body）；Audit 在 handler 前最后一环
+// （defer 模式保证一定 emit）。
+func registerBusinessRoutes(
+	srv *httpapi.Server,
+	h *relay.RelayHandler,
+	keySvc businesskey.Service,
+	rpm *businesskey.InProcessRPM,
+	auditLogger audit.AuditLogger,
+	m *obs.Metrics,
+) {
+	g := srv.Engine().Group("/v1")
+	g.Use(
+		middleware.HSTS(),
+		middleware.BusinessBodyLimit(m.BusinessAPIBodyTooLargeTotal),
+		middleware.BusinessKeyAuth(keySvc, m.BusinessAPIAuthFailedTotal),
+		middleware.BusinessRPM(rpm, m.BusinessAPIRateLimitedTotal),
+		middleware.BusinessAudit(auditLogger, m.AdminAuditWriteFailedTotal),
+	)
+	g.POST("/chat/completions", h.ChatCompletion)
 }

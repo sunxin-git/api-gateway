@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sunxin-git/api-gateway/internal/admintoken"
+	"github.com/sunxin-git/api-gateway/internal/businesskey"
 	"github.com/sunxin-git/api-gateway/internal/config"
 	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/obs"
@@ -42,6 +43,9 @@ type CLIServices struct {
 	// AdminToken Admin Token 域服务（token create / list / revoke 走它；D-min Unit 6）。
 	// 注入 cfg.TokenPepperBytes，hash 算法与 HTTP 鉴权路径一致。
 	AdminToken *admintoken.PostgresService
+	// BusinessKey 业务 API Key 域服务（business-key create / list / revoke 走它；F-min Unit 6）。
+	// 与 AdminToken 共享 cfg.TokenPepperBytes（F-min 决策 D4）；CLI 创出 key 可被 relay 鉴权命中。
+	BusinessKey *businesskey.PostgresService
 	// Log slog logger（admin-cli 输出到 stderr，避免污染 stdout JSON）。
 	Log *slog.Logger
 	// Metrics 完整 Prometheus 指标容器；CLI 路径不暴露 /metrics，但 reconciler 需要它 bump 计数。
@@ -104,15 +108,21 @@ func OpenServices(ctx context.Context) (*CLIServices, func(), error) {
 	// Admin Token 域服务（D-min Unit 6）；hash pepper 与 HTTP 路径同源 → CLI 创出 token 可被进程鉴权命中。
 	tokenSvc := admintoken.NewPostgresService(pool, cfg.TokenPepperBytes, logger)
 
+	// Business Key 域服务（F-min Unit 6）；同 pepper → CLI 创出 key 可被 relay 鉴权命中。
+	// 内部启异步 last_used_at flush goroutine；cleanup 时 Close 触发最终 flush + 停 goroutine。
+	businessKeySvc := businesskey.NewPostgresService(pool, cfg.TokenPepperBytes, logger)
+
 	svc := &CLIServices{
-		Pool:       pool,
-		Service:    service,
-		Reconciler: reconciler,
-		AdminToken: tokenSvc,
-		Log:        logger,
-		Metrics:    metrics,
+		Pool:        pool,
+		Service:     service,
+		Reconciler:  reconciler,
+		AdminToken:  tokenSvc,
+		BusinessKey: businessKeySvc,
+		Log:         logger,
+		Metrics:     metrics,
 	}
 	cleanup := func() {
+		_ = businessKeySvc.Close() // 停 flush goroutine + 最终 flush（CLI 短命，多数无 pending）
 		pool.Close()
 	}
 	return svc, cleanup, nil

@@ -478,3 +478,53 @@
 - nullable `bigint` → `pgtype.Int8`
 - nullable `int` → `pgtype.Int4`
 - nullable `timestamptz` → `sql.NullTime`
+
+---
+
+## 0004 演化（2026-05-27）
+
+> 计划：[Phase 2 工作流 F-min plan](../plans/2026-05-27-004-feat-workflow-f-min-openai-compat-relay-plan.md) Unit 1
+
+### `actor_type` 枚举扩展
+
+新增枚举值 `business_key`（与 admin_token / cli / system / task 平级）：
+
+```sql
+ALTER TYPE actor_type ADD VALUE IF NOT EXISTS 'business_key';
+```
+
+**用途**：业务系统通过 `/v1/chat/completions` 走 relay 写 ledger entry 时，actor 标识为 `business_key:{api_key_id}`，与 `admin_token:{token_id}` 同 pattern 便于审计反查。
+
+**Plan §Unit 7 决策点提前**：原 plan 把此枚举扩展放 Unit 7 装配阶段；提前到 Unit 1 避免 Unit 2-7 期间 Go 常量 `ActorTypeBusinessKey` 已存在但 enum 未加导致运行时 INSERT 失败的半截状态。
+
+**PG 限制**：`DROP VALUE` 不被支持；0004.down.sql 仅删表，actor_type `business_key` 枚举值保留（无害；彻底回滚 F-min 时按 down.sql 注释中 SOP 手工 CREATE TYPE _new + ALTER TABLE + DROP 老 TYPE）。
+
+### 新表：`business_account_api_key`（业务系统对外 API Key）
+
+业务系统通过 Bearer biz-key 调网关 `/v1/chat/completions`；与 admin token 共享 HMAC pepper（F-min 决策 D4：复用 `GATEWAY_TOKEN_PEPPER`，少一个运维负担）。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | bigserial PK | 自增 |
+| `business_account_id` | text NOT NULL FK | → business_account(id) ON DELETE CASCADE（账户删除时 key 一并失效）|
+| `description` | text NOT NULL | 运营标签，如 "creator-platform-prod-key-1" |
+| `key_hash` | text NOT NULL UNIQUE | HMAC-SHA-256(GATEWAY_TOKEN_PEPPER, plaintext) hex (64 char)；与 admin token 同 pepper 同算法 |
+| `requests_per_minute` | int NULL | RPM 上限；NULL = 不限速；按 key.id 维度计数（InProcessRPM）|
+| `created_by` | text NOT NULL | MVP admin-cli 硬编码 "cli:bootstrap" |
+| `created_at` | timestamptz NOT NULL DEFAULT NOW() | |
+| `revoked_at` | timestamptz NULL | revoke 时写入；查询用 WHERE revoked_at IS NULL 过滤 |
+| `last_used_at` | timestamptz NULL | 鉴权命中时 best-effort 异步更新（5min 批量 flush）；运维查"长期未用 key"|
+| `updated_at` | timestamptz NOT NULL DEFAULT NOW() | |
+
+- **UNIQUE** `(key_hash)` —— 鉴权热路径单 row lookup（O(log n) btree）
+- **INDEX** `idx_business_account_api_key_account_active(business_account_id) WHERE revoked_at IS NULL` —— 运维查"账户 X 有几个 key 在用"
+- **FK CASCADE** `business_account_id → business_account(id) ON DELETE CASCADE` —— 删账户时 key 一并失效（防"账户没了但 key 还能 auth"）
+- **CHECK** `requests_per_minute IS NULL OR requests_per_minute > 0` —— RPM 非负兜底（admin-cli 入参校验已保证）
+
+### sqlc 生成代码
+
+`internal/db/business_account_api_key.sql.go` 7 个函数：
+
+- `InsertBusinessKey` / `FindActiveBusinessKeyByHash`（鉴权热路径）/ `FindBusinessKeyByID`（运维 / audit）/ `RevokeBusinessKey`（COALESCE 保留首次 timestamp）
+- `ListActiveBusinessKeysByAccount` / `ListAllActiveBusinessKeys`（**不**返 key_hash）
+- `TouchBusinessKeyLastUsed`（异步 best-effort 鉴权命中时间戳；5min 批量 flush）

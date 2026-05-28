@@ -712,7 +712,7 @@ func TestRedactSensitiveAttrs_HidesAuthorization(t *testing.T) {
 	assert.NotContains(t, out, "sk-secret")
 	assert.NotContains(t, out, "abc123")
 	assert.NotContains(t, out, "supersecret")
-	assert.Contains(t, out, redactedPlaceholder)
+	assert.Contains(t, out, "[REDACTED]")
 	assert.Contains(t, out, "visible", "非敏感字段不应被 redact")
 }
 

@@ -39,6 +39,9 @@ type Querier interface {
 	// 鉴权热路径：根据 token_hash 单 query 查活跃 token（未 revoke + 未过期）。
 	// service 层调用前先算 hex = hex.EncodeToString(HMAC-SHA-256(pepper, plaintext))。
 	FindActiveAdminTokenByHash(ctx context.Context, tokenHash string) (FindActiveAdminTokenByHashRow, error)
+	// 鉴权热路径：根据 key_hash 单 row 查活跃 key（未 revoke）。
+	// service 层调用前先算 hex = hex.EncodeToString(HMAC-SHA-256(pepper, plaintext))。
+	FindActiveBusinessKeyByHash(ctx context.Context, keyHash string) (BusinessAccountApiKey, error)
 	// Commit/Release 前置校验：找同 correlation_id 的 active reserve（未 commit / release）。
 	// NOT EXISTS 子查询确认同 correlation_id 没有 commit/release entry。
 	FindActiveReserveByCorrelation(ctx context.Context, arg FindActiveReserveByCorrelationParams) (FindActiveReserveByCorrelationRow, error)
@@ -46,6 +49,8 @@ type Querier interface {
 	FindAdminTokenByID(ctx context.Context, id int64) (FindAdminTokenByIDRow, error)
 	// 用于区分「未找到 reserve」与「reserve 已 commit/release」（service 用以返回不同 sentinel）。
 	FindAnyReserveByCorrelation(ctx context.Context, arg FindAnyReserveByCorrelationParams) (FindAnyReserveByCorrelationRow, error)
+	// 按 id 查 key（不限制是否 revoked，运维 / audit 用）。
+	FindBusinessKeyByID(ctx context.Context, id int64) (BusinessAccountApiKey, error)
 	// 通用反查：Reserve/Commit/Release/Refund 幂等用此 query 检查同 correlation_id+entry_type 是否已存在。
 	FindLedgerEntryByCorrelationAndType(ctx context.Context, arg FindLedgerEntryByCorrelationAndTypeParams) (FindLedgerEntryByCorrelationAndTypeRow, error)
 	// ============================================================================
@@ -112,6 +117,26 @@ type Querier interface {
 	// 插入新 Admin Token；调用方负责生成 plaintext + HMAC-SHA-256(pepper, plaintext) → token_hash hex。
 	// 7 个阀门字段 NULL = 无限制；ip_allowlist 至少 1 个 CIDR（service 层校验，schema 不强制）。
 	InsertAdminToken(ctx context.Context, arg InsertAdminTokenParams) (InsertAdminTokenRow, error)
+	// business_account_api_key.sql —— 业务侧 API Key CRUD + 鉴权热路径
+	//
+	// 设计文档：docs/multimedia-gateway-design.md §9
+	// 实施计划：docs/plans/2026-05-27-004-feat-workflow-f-min-openai-compat-relay-plan.md Unit 1
+	//
+	// 命名约定：
+	//   - InsertBusinessKey / FindActiveBusinessKeyByHash / FindBusinessKeyByID / RevokeBusinessKey：CRUD
+	//   - ListActiveBusinessKeysByAccount / ListAllActiveBusinessKeys：admin-cli 与运维查询
+	//   - TouchBusinessKeyLastUsed：异步 best-effort 鉴权命中时间戳
+	//
+	// 关键 PG 语义：
+	//   - UNIQUE on key_hash：鉴权热路径单 row 查询（O(log n) btree）
+	//   - COALESCE(revoked_at, NOW())：Revoke 多次同 id 保留首次 timestamp（与 admin token 一致）
+	//   - WHERE revoked_at IS NULL：所有"active key"查询都过滤已吊销，零额外索引开销
+	// ============================================================================
+	// 1. CRUD
+	// ============================================================================
+	// 插入新业务 key；调用方负责生成 plaintext + HMAC-SHA-256(pepper, plaintext) → key_hash hex。
+	// requests_per_minute NULL = 不限速；service 层校验 > 0（DB CHECK 也兜底）。
+	InsertBusinessKey(ctx context.Context, arg InsertBusinessKeyParams) (BusinessAccountApiKey, error)
 	// outbox.sql —— webhook_event_outbox 写路径
 	//
 	// 本工作流仅实现 INSERT；dispatcher（claim/lease 抢占 + 推送 + DLQ）由 C-min 落地。
@@ -121,6 +146,15 @@ type Querier interface {
 	// 列出所有活跃 token（未 revoke）；按 created_at DESC 排序便于运维查最新发放。
 	// 返回**不含** token_hash（避免泄漏；明文已无法获取，hash 也只入审计 / 排查路径）。
 	ListActiveAdminTokens(ctx context.Context) ([]ListActiveAdminTokensRow, error)
+	// ============================================================================
+	// 2. 列表查询（admin-cli list / 运维）
+	// ============================================================================
+	// 列出指定账户的所有活跃 key（未 revoke）；按 created_at DESC 排序便于运维查最新发放。
+	// **不**返 key_hash（避免泄漏；明文已无法获取，hash 也只入鉴权 / 排查路径）。
+	ListActiveBusinessKeysByAccount(ctx context.Context, businessAccountID string) ([]ListActiveBusinessKeysByAccountRow, error)
+	// 列出所有账户的活跃 key；admin-cli `business-key list`（不带 --business-account-id）用。
+	// **不**返 key_hash。按 created_at DESC 排序。
+	ListAllActiveBusinessKeys(ctx context.Context) ([]ListAllActiveBusinessKeysRow, error)
 	// reconciler 全表扫起点：仅取 ID + 当前 version；后续读 SUM 时再单只读 tx 中拉一致快照。
 	ListAllUnfrozenAccountsForReconciler(ctx context.Context) ([]ListAllUnfrozenAccountsForReconcilerRow, error)
 	// reconciler 收尾 watchdog：扫出处于 rebuild_in_progress 状态且 frozen 时间过长的账户。
@@ -189,6 +223,10 @@ type Querier interface {
 	// 返回值（id + 新 revoked_at + 原 revoked_at）让 service 区分"首次 revoke" vs "已 revoked 幂等"。
 	// 不存在 id 时返 0 rows（service 层判 ErrTokenNotFound）。
 	RevokeAdminToken(ctx context.Context, id int64) (RevokeAdminTokenRow, error)
+	// Revoke 给定 id 的 key。
+	// COALESCE 保留首次 revoke 时间戳（与 admin token 一致）；多次 Revoke 同 id 不覆盖。
+	// 不存在 id 时返 0 rows（service 层判 ErrKeyNotFound）。
+	RevokeBusinessKey(ctx context.Context, id int64) (RevokeBusinessKeyRow, error)
 	// ============================================================================
 	// 3. drift reconciler 聚合
 	// ============================================================================
@@ -196,6 +234,13 @@ type Querier interface {
 	// 与 balance 表比对得 drift。recharge_sum / refund_sum 用 FILTER 仅累加对应 entry_type。
 	// COALESCE 兜底 NULL（账户 0 条 ledger 时 SUM 返回 NULL）。
 	SumLedgerDeltasByAccount(ctx context.Context, businessAccountID string) (SumLedgerDeltasByAccountRow, error)
+	// ============================================================================
+	// 3. 鉴权命中异步更新（best-effort）
+	// ============================================================================
+	// 异步批量更新 last_used_at（service 层 5min 批量 flush）；single id 更新。
+	// 运维用途：清理长期未用 key（如 WHERE last_used_at < NOW() - INTERVAL '90 days'）。
+	// best-effort：失败不影响鉴权主路径；service 层会捕获并 log 但不返业务错。
+	TouchBusinessKeyLastUsed(ctx context.Context, id int64) error
 	// 跳闸：把 breaker_tripped_until 写为 NOW() + 1h；service 在 RecordCircuitError 返 error_count ≥ 100 时调。
 	// 已跳闸 token 重复调用：tripped_until 取较大值（不会缩短跳闸期）。
 	TripCircuitBreaker(ctx context.Context, tokenID int64) (TripCircuitBreakerRow, error)
