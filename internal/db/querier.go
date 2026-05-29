@@ -11,6 +11,16 @@ import (
 )
 
 type Querier interface {
+	// 鉴权热路径：账户是否被授权使用该 model（提交前校验）。
+	CheckEntitlement(ctx context.Context, arg CheckEntitlementParams) (bool, error)
+	// ============================================================================
+	// 4. account_model_concurrency（R15 并发硬上限：原子 claim / release）
+	// ============================================================================
+	// R15 原子占位（提交前，与 task 落库同事务）：每 (account, model) 计数行 +1，
+	// 仅当 inflight < @cap_limit。首次用 ON CONFLICT lazy upsert（新行 inflight=1，前提 cap>=1）。
+	// 返回新 inflight；**返 0 行（pgx.ErrNoRows）= 占不到 = 调用方返 429**。
+	// 用条件 UPDATE ... RETURNING（单语句原子，PG 行锁串行化），杜绝 count-then-act 的幻读 TOCTOU。
+	ClaimConcurrencySlot(ctx context.Context, arg ClaimConcurrencySlotParams) (int32, error)
 	// 结算（无残余，actualCost == reserveAmount）：只 INSERT commit + UPDATE balance。
 	// 与 CommitWithReleaseAtomic 同语义，但少一条 release entry，sqlc 类型推导更干净。
 	CommitAtomic(ctx context.Context, arg CommitAtomicParams) (CommitAtomicRow, error)
@@ -24,6 +34,18 @@ type Querier interface {
 	//
 	// 返回 commit + release 两条 ledger 信息 + 新 balance。
 	CommitWithReleaseAtomic(ctx context.Context, arg CommitWithReleaseAtomicParams) (CommitWithReleaseAtomicRow, error)
+	// ============================================================================
+	// 2. 状态机 CAS（显式 from → to；:execrows 判成败）
+	// ============================================================================
+	// 通用状态 CAS：仅当当前 status = @from_status 时推进到 @to_status。
+	// 用于无附带字段的转移（如 UPSTREAM_SUBMITTED→SETTLING、SETTLING→SETTLED/SETTLE_FAILED）。
+	CompareAndSwapTaskStatus(ctx context.Context, arg CompareAndSwapTaskStatusParams) (int64, error)
+	// ============================================================================
+	// 3. recover / reconciler 扫描 + 在途计数（metrics / 兜底，非 R15 cap）
+	// ============================================================================
+	// 统计某 (account, model) 当前在途任务数（reconciler 对账 / metrics 用）。
+	// **非** R15 cap 计数——cap 由 account_model_concurrency 原子 claim 承载（ADR-0006 决策 2）。
+	CountInflightByAccountModel(ctx context.Context, arg CountInflightByAccountModelParams) (int64, error)
 	// business_account.sql —— 业务账户 CRUD
 	//
 	// 适用范围：账户创建（同事务建 balance 行）/ 读取 / 入口 active 校验。
@@ -36,6 +58,8 @@ type Querier interface {
 	CreateBusinessAccount(ctx context.Context, arg CreateBusinessAccountParams) (BusinessAccount, error)
 	// 创建账户的零值 balance 行（与 CreateBusinessAccount 同事务）。
 	CreateBusinessAccountBalanceZero(ctx context.Context, businessAccountID string) (BusinessAccountBalance, error)
+	// 硬删除渠道（运营慎用；返回受影响行数判断是否存在）。
+	DeleteChannel(ctx context.Context, id int64) (int64, error)
 	// 鉴权热路径：根据 token_hash 单 query 查活跃 token（未 revoke + 未过期）。
 	// service 层调用前先算 hex = hex.EncodeToString(HMAC-SHA-256(pepper, plaintext))。
 	FindActiveAdminTokenByHash(ctx context.Context, tokenHash string) (FindActiveAdminTokenByHashRow, error)
@@ -78,18 +102,35 @@ type Querier interface {
 	// 入口校验：仅返回 status + isolation_required，避免拉全字段；
 	// service 层在写操作入口先调用此 query 判 status='active'。
 	GetBusinessAccountForActiveCheck(ctx context.Context, id string) (GetBusinessAccountForActiveCheckRow, error)
+	// 按 id 查渠道（含密文；service 层即用即解、不回显明文）。
+	GetChannelByID(ctx context.Context, id int64) (Channel, error)
 	// 查熔断器状态；middleware 在 CheckCircuitBreaker 时调用。
 	// 不存在 token_id 时返 0 rows（service 视作未熔断）。
 	GetCircuitState(ctx context.Context, tokenID int64) (GetCircuitStateRow, error)
+	// 读某 (account, model) 当前 inflight（admin / metrics）。
+	GetConcurrency(ctx context.Context, arg GetConcurrencyParams) (AccountModelConcurrency, error)
 	// ============================================================================
 	// 4. rebuild 全量读
 	// ============================================================================
 	// rebuild TX2 用：按 id ASC 全量取 ledger，应用层累加得 expected balance。
 	// ORDER BY id 保证回放顺序与原写入顺序一致（虽然累加是可交换的，方便审计）。
 	GetLedgerEntriesForRebuild(ctx context.Context, businessAccountID string) ([]GetLedgerEntriesForRebuildRow, error)
+	// 内部按 id 查任务（worker / reconciler 用，不做归属过滤）。
+	GetTaskByID(ctx context.Context, id string) (Task, error)
+	// 按上游 task_id 反查本地任务（回调入口 / fetch reconciler 用）。
+	GetTaskByUpstreamTaskID(ctx context.Context, upstreamTaskID pgtype.Text) (Task, error)
+	// 业务侧只读查询：强制归属校验（id + business_account_id）。
+	// 不匹配返 0 rows → handler 返 404（跨租户不可枚举，符合 CLAUDE.md ISP / 失败优先）。
+	GetTaskForAccount(ctx context.Context, arg GetTaskForAccountParams) (Task, error)
 	// 查指定 token 当日用量；不存在则返 0 rows（service 层视作 0 用量）。
 	// day 同样按 UTC（与累加 query 对齐）。
 	GetTokenUsage(ctx context.Context, tokenID int64) (GatewayAdminTokenUsage, error)
+	// entitlement.sql —— 账户×模型授权 grant / revoke / check
+	//
+	// 实施计划：docs/plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md Unit 2（供 Unit 10/11）
+	// 语义：行存在 = 已授权；revoke = 删行；check = 存在性。复合主键 (account, gateway_model)。
+	// 授权账户使用某 gateway model；幂等（重复 grant 仅刷新 updated_at，不报错）。
+	GrantEntitlement(ctx context.Context, arg GrantEntitlementParams) (BusinessAccountModelEntitlement, error)
 	// ============================================================================
 	// 2. Token 每日用量累计
 	// ============================================================================
@@ -137,12 +178,34 @@ type Querier interface {
 	// 插入新业务 key；调用方负责生成 plaintext + HMAC-SHA-256(pepper, plaintext) → key_hash hex。
 	// requests_per_minute NULL = 不限速；service 层校验 > 0（DB CHECK 也兜底）。
 	InsertBusinessKey(ctx context.Context, arg InsertBusinessKeyParams) (BusinessAccountApiKey, error)
+	// channel.sql —— 渠道（上游 provider 凭据抽象）CRUD + 路由热路径查询
+	//
+	// 设计文档：docs/multimedia-gateway-design.md §8.2
+	// 实施计划：docs/plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md Unit 2（供 Unit 3 channel service）
+	//
+	// 安全约定：credentials_encrypted 是 envelope 密文（AES-GCM，KEK），明文绝不入库；
+	//   key_version 标记加密用的 KEK 版本，支持轮换（ADR-0006 决策 4）。
+	// 创建渠道；credentials_encrypted 由 service 层（Unit 3）用 KEK 加密后传入。
+	InsertChannel(ctx context.Context, arg InsertChannelParams) (Channel, error)
 	// outbox.sql —— webhook_event_outbox 写路径
 	//
 	// 本工作流仅实现 INSERT；dispatcher（claim/lease 抢占 + 推送 + DLQ）由 C-min 落地。
 	// 同事务 INSERT outbox event；retention_until / is_financial / delivery_idempotency_key 由调用方算好。
 	// delivery_status 默认 'pending'，等待 dispatcher 扫描。
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (WebhookEventOutbox, error)
+	// task.sql —— 异步任务 CRUD + 状态机 CAS + recover/reconciler 扫描 + R15 并发计数行
+	//
+	// 设计文档：docs/multimedia-gateway-design.md §9 / §9ter / §9.5
+	// 实施计划：docs/plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md Unit 2（供 Unit 6/8）
+	// 决策：ADR-0006（状态机 CAS 必带 from 条件；R15 走 account_model_concurrency 原子 claim）
+	//
+	// 硬约束（CLAUDE.md 状态机模式）：所有状态变更**只**走带 from 条件的 CAS（:execrows，
+	//   受影响 0 行 = CAS 失败 = 状态已被他人推进）；**禁止**裸 UPDATE ... WHERE id 不带 status。
+	// ============================================================================
+	// 1. CRUD
+	// ============================================================================
+	// 提交流程落库（status 默认 SUBMITTED）；token_id / channel_id / callback_token 可空。
+	InsertTask(ctx context.Context, arg InsertTaskParams) (Task, error)
 	// 列出所有活跃 token（未 revoke）；按 created_at DESC 排序便于运维查最新发放。
 	// 返回**不含** token_hash（避免泄漏；明文已无法获取，hash 也只入审计 / 排查路径）。
 	ListActiveAdminTokens(ctx context.Context) ([]ListActiveAdminTokensRow, error)
@@ -152,11 +215,17 @@ type Querier interface {
 	// 列出指定账户的所有活跃 key（未 revoke）；按 created_at DESC 排序便于运维查最新发放。
 	// **不**返 key_hash（避免泄漏；明文已无法获取，hash 也只入鉴权 / 排查路径）。
 	ListActiveBusinessKeysByAccount(ctx context.Context, businessAccountID string) ([]ListActiveBusinessKeysByAccountRow, error)
+	// 列出所有启用的渠道（路由候选 / 运营列表）。
+	ListActiveChannels(ctx context.Context) ([]Channel, error)
+	// 按 provider_type 列出启用的渠道（工厂按 provider 选 adapter 时用）。
+	ListActiveChannelsByProvider(ctx context.Context, providerType string) ([]Channel, error)
 	// 列出所有账户的活跃 key；admin-cli `business-key list`（不带 --business-account-id）用。
 	// **不**返 key_hash。按 created_at DESC 排序。
 	ListAllActiveBusinessKeys(ctx context.Context) ([]ListAllActiveBusinessKeysRow, error)
 	// reconciler 全表扫起点：仅取 ID + 当前 version；后续读 SUM 时再单只读 tx 中拉一致快照。
 	ListAllUnfrozenAccountsForReconciler(ctx context.Context) ([]ListAllUnfrozenAccountsForReconcilerRow, error)
+	// 列出账户的全部授权 model（admin / 运维）。
+	ListEntitlementsByAccount(ctx context.Context, businessAccountID string) ([]BusinessAccountModelEntitlement, error)
 	// reconciler 收尾 watchdog：扫出处于 rebuild_in_progress 状态且 frozen 时间过长的账户。
 	//
 	// 用途：U8 RebuildBalance 三事务流程中第二阶段崩溃 / 进程被 kill 时，账户会停留在
@@ -165,6 +234,16 @@ type Querier interface {
 	//
 	// @threshold 参数取自 reconciler.rebuildStuckThreshold（默认 10 分钟）。
 	ListStuckRebuildAccounts(ctx context.Context, threshold pgtype.Interval) ([]ListStuckRebuildAccountsRow, error)
+	// CAS SUBMITTED → UPSTREAM_SUBMITTING，并写入 worker 抢占 lease（submit_locked_*）。
+	// 仅一个 worker 能 CAS 成功；其余受影响 0 行放弃。
+	MarkTaskSubmitting(ctx context.Context, arg MarkTaskSubmittingParams) (int64, error)
+	// CAS UPSTREAM_SUBMITTING → UPSTREAM_SUBMITTED，同步持久化 upstream_task_id + 提交时刻。
+	// 这是「上游 Submit 成功 → 存 upstream_task_id」的原子落点（ADR-0006 决策 5 双提交防护核心）。
+	MarkTaskUpstreamSubmitted(ctx context.Context, arg MarkTaskUpstreamSubmittedParams) (int64, error)
+	// CAS 进入上游终态（COMPLETED/FAILED/CANCELLED/EXPIRED），写 terminal_at + 错误信息，
+	// 并**置空 callback_token**（终态后不再接受回调，防 token 泄露后被滥用，ADR-0006 决策 5）。
+	// 调用方负责在同事务内释放并发 claim（ReleaseConcurrencySlot）。
+	MarkTaskUpstreamTerminal(ctx context.Context, arg MarkTaskUpstreamTerminalParams) (int64, error)
 	// ledger.sql —— 账本流水写入 + 幂等查询 + drift 聚合 + rebuild 全量读
 	//
 	// 设计文档：docs/multimedia-gateway-design.md §3ter
@@ -208,6 +287,8 @@ type Querier interface {
 	// 释放预占：reserved 减 + available 增；CAS 含 reserved >= @amount AND version=?
 	// 不查 frozen（允许 inflight 完成）。
 	ReleaseAtomic(ctx context.Context, arg ReleaseAtomicParams) (ReleaseAtomicRow, error)
+	// 释放并发槽（进上游终态 CAS 赢家同事务内调用）：inflight -1，永不为负（防 double-release）。
+	ReleaseConcurrencySlot(ctx context.Context, arg ReleaseConcurrencySlotParams) (int64, error)
 	// rebuild TX3 专用：用 last_ledger_id CAS 校验「TX2 读快照后没有新 entry 写入」；
 	// 命中行数 = 0 表示并发漂移，调用方应回到 TX2 重读快照。
 	// 不参与日常写路径，绕开 version CAS（rebuild 期间 frozen=true 已阻新业务写）。
@@ -227,6 +308,20 @@ type Querier interface {
 	// COALESCE 保留首次 revoke 时间戳（与 admin token 一致）；多次 Revoke 同 id 不覆盖。
 	// 不存在 id 时返 0 rows（service 层判 ErrKeyNotFound）。
 	RevokeBusinessKey(ctx context.Context, id int64) (RevokeBusinessKeyRow, error)
+	// 撤销授权（删行）；返回受影响行数判断是否原本存在。
+	RevokeEntitlement(ctx context.Context, arg RevokeEntitlementParams) (int64, error)
+	// expire worker：扫上游侧仍在途但已超最长执行期的任务 → CAS→EXPIRED + release 兜底。
+	ScanExpirableTasks(ctx context.Context, arg ScanExpirableTasksParams) ([]Task, error)
+	// recover worker：扫 UPSTREAM_SUBMITTING 且 lease 过期的任务（崩溃在提交窗口）。
+	// ADR-0006 决策 5：上游无幂等键/不可反查 → 这些任务 fail-closed（不自动重投），
+	// 调用方据此 CAS→FAILED + release + 告警。用 idx_task_submit_recover。
+	ScanRecoverableTasks(ctx context.Context, arg ScanRecoverableTasksParams) ([]Task, error)
+	// fetch reconciler：扫 UPSTREAM_SUBMITTED 超时未终态的任务 → 主动 Poll 上游兜底。
+	ScanStuckUpstreamSubmitted(ctx context.Context, arg ScanStuckUpstreamSubmittedParams) ([]Task, error)
+	// reconciler：扫 SUBMITTED 滞留超阈值（入队丢失 / Redis 抖动导致无 Asynq job）→ 幂等重投。
+	ScanSubmittedNoJob(ctx context.Context, arg ScanSubmittedNoJobParams) ([]Task, error)
+	// 启用 / 停用渠道（软下线优先于硬删除）。
+	SetChannelEnabled(ctx context.Context, arg SetChannelEnabledParams) (SetChannelEnabledRow, error)
 	// ============================================================================
 	// 3. drift reconciler 聚合
 	// ============================================================================
@@ -247,6 +342,9 @@ type Querier interface {
 	// 解冻：CAS 含 frozen=true AND version=?；frozen_reason 重写为新值（rebuild_completed / manual_unfreeze）。
 	// 0 行 = 已 unfrozen（幂等成功）或 version 冲突。
 	UnfreezeAtomic(ctx context.Context, arg UnfreezeAtomicParams) (BusinessAccountBalance, error)
+	// 更新渠道凭据密文 + KEK 版本（凭据轮换 / KEK 重加密命令用，ADR-0006 决策 4）。
+	// 仅动密文与版本，不碰其他配置；明文绝不入库。
+	UpdateChannelCredentials(ctx context.Context, arg UpdateChannelCredentialsParams) (Channel, error)
 }
 
 var _ Querier = (*Queries)(nil)

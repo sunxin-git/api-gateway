@@ -1,7 +1,7 @@
 # Schema 总览（当前生效版本）
 
-> **当前 migration 版本**：0003
-> **migration 文件**：`migrations/0001_init.{up,down}.sql` + `migrations/0002_ledger_fields_extension.{up,down}.sql` + `migrations/0003_admin_token_usage_and_circuit.{up,down}.sql`
+> **当前 migration 版本**：0007
+> **migration 文件**：`0001_init` + `0002_ledger_fields_extension` + `0003_admin_token_usage_and_circuit` + `0004_business_account_api_key` + `0005_async_video_relay` + `0006_task_status_settle_failed` + `0007_task_inflight_index_exclude_settle_failed`（均含 `.{up,down}.sql`）
 > **PG 版本要求**：≥ 15（项目宪法 CLAUDE.md 技术栈）
 > **本文档命名约定**：不带版本号，永远描述「当前生效 schema」；每次 migration 后增量加章节
 >
@@ -17,6 +17,10 @@
 | 0001 | 2026-05-26 | 初始 9 张表 + 5 个枚举 + 账本不变量 CHECK + 非负 CHECK | [Phase 1 plan](../plans/2026-05-26-001-feat-phase-1-skeleton-and-migrations-plan.md) |
 | 0002 | 2026-05-26 | ledger 字段扩展（delta/reference/metadata/actor_type/actor_id/canonical_body_sha256）+ balance.last_ledger_id + 不可变 trigger（UPDATE/DELETE/TRUNCATE）+ entry-level CHECK + 复合 UNIQUE 索引（idempotency_key per entry_type、correlation_id per type）+ REVOKE 高危权限 + actor_type 枚举 | [Phase 2 工作流 E plan](../plans/2026-05-26-002-feat-workflow-e-ledger-infrastructure-plan.md) |
 | 0003 | 2026-05-27 | gateway_admin_token 增加 single_refund_max + daily_refund_quota_limit 两阀门 + token_hash COMMENT 修订为 HMAC-SHA-256 with pepper + 新表 gateway_admin_token_usage（每日用量累计）+ 新表 gateway_admin_token_circuit（熔断器状态） | [Phase 2 工作流 D-min plan](../plans/2026-05-27-003-feat-workflow-d-min-admin-api-plan.md) |
+| 0004 | 2026-05-27 | actor_type 枚举增 business_key + 新表 business_account_api_key（业务侧对外 API Key，HMAC pepper 复用） | [Phase 2 工作流 F-min plan](../plans/2026-05-27-004-feat-workflow-f-min-openai-compat-relay-plan.md) |
+| 0005 | 2026-05-29 | 异步视频中继数据层：task 加 callback_token + upstream_submitted_at；新表 account_model_concurrency（R15 并发计数行）+ business_account_model_entitlement（账户×模型授权） | [异步视频中继 MVP plan](../plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md) |
+| 0006 | 2026-05-29 | task_status 枚举增 SETTLE_FAILED（第 10 态，结算失败终态）；独立文件（PG 不能在同事务使用新枚举值） | 同上 |
+| 0007 | 2026-05-29 | 重建 idx_task_inflight，终态排除谓词纳入 SETTLE_FAILED（须在 0006 ADD VALUE 之后的独立文件） | 同上 |
 
 ---
 
@@ -44,7 +48,7 @@
 | 类型名 | 取值 | 关联表 |
 |---|---|---|
 | `ledger_entry_type` | `recharge` / `reserve` / `commit` / `release` / `refund` / `cashout` / `recharge_reversal` / `adjust` / `expire` | `business_account_ledger.entry_type` |
-| `task_status` | `SUBMITTED` / `UPSTREAM_SUBMITTING` / `UPSTREAM_SUBMITTED` / `COMPLETED` / `FAILED` / `CANCELLED` / `EXPIRED` / `SETTLING` / `SETTLED` | `task.status` |
+| `task_status` | `SUBMITTED` / `UPSTREAM_SUBMITTING` / `UPSTREAM_SUBMITTED` / `COMPLETED` / `FAILED` / `CANCELLED` / `EXPIRED` / `SETTLING` / `SETTLED` / `SETTLE_FAILED`（0006 增） | `task.status` |
 | `outbox_delivery_status` | `pending` / `delivering` / `delivered` / `failed` / `dead_letter` | `webhook_event_outbox.delivery_status` |
 | `fallback_policy` | `strict`（默认） / `next_rule` / `global_pool` / `legacy_distributor` | `channel_routing_rule.fallback_policy` |
 | `business_account_status` | `active` / `suspended` / `frozen` / `deleted` | `business_account.status` |
@@ -307,6 +311,7 @@
 | `model` | text | NO | — | 目标模型 |
 | `status` | `task_status` | NO | `'SUBMITTED'` | 任务状态机；状态转移仅允许 §9ter.2 状态转移表方向（CAS） |
 | `upstream_task_id` | text | YES | NULL | 上游任务 ID（UPSTREAM_SUBMITTED 后写入） |
+| `upstream_submitted_at` | timestamptz | YES | NULL | 进入 UPSTREAM_SUBMITTED 的时刻（0005）；fetch reconciler 判上游超时 |
 | `submit_locked_until` | timestamptz | YES | NULL | v1.2.3：worker 抢占 lease 截止；超时 cron 回退到 SUBMITTED |
 | `submit_locked_by` | text | YES | NULL | 抢占 worker ID |
 | `submit_recover_count` | int | NO | 0 | v1.2.3：UPSTREAM_SUBMITTING 崩溃恢复次数；≥ 3 转 FAILED |
@@ -316,6 +321,7 @@
 | `terminal_at` | timestamptz | YES | NULL | 终态时间（COMPLETED / FAILED / ...） |
 | `error_code` | text | YES | NULL | 错误码 |
 | `error_message` | text | YES | NULL | 错误信息 |
+| `callback_token` | text | YES | NULL | 回调 per-task token（0005）；进终态后置空；绝不入日志 / 不放 query string |
 | `updated_at` | timestamptz | NO | `NOW()` | 最后更新时间 |
 
 **约束**：
@@ -326,7 +332,7 @@
 - `chk_task_accounting_month_format` CHECK (accounting_month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$')
 
 **索引**（4 个，全部针对 P0 已知热路径）：
-- `idx_task_inflight` (business_account_id, status) **WHERE status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED', 'SETTLED')` —— inflight 查询（部分索引）
+- `idx_task_inflight` (business_account_id, status) **WHERE status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED', 'SETTLED', 'SETTLE_FAILED')` —— inflight 查询（部分索引；0007 把 SETTLE_FAILED 纳入终态排除）
 - `idx_task_submit_recover` (status, submit_locked_until) **WHERE status = 'UPSTREAM_SUBMITTING'** —— 崩溃恢复 cron 扫描
 - `idx_task_accounting_month` (accounting_month, status) —— 月结查询
 - `idx_task_channel_id` (channel_id) **WHERE channel_id IS NOT NULL** —— 按渠道反查
@@ -528,3 +534,87 @@ ALTER TYPE actor_type ADD VALUE IF NOT EXISTS 'business_key';
 - `InsertBusinessKey` / `FindActiveBusinessKeyByHash`（鉴权热路径）/ `FindBusinessKeyByID`（运维 / audit）/ `RevokeBusinessKey`（COALESCE 保留首次 timestamp）
 - `ListActiveBusinessKeysByAccount` / `ListAllActiveBusinessKeys`（**不**返 key_hash）
 - `TouchBusinessKeyLastUsed`（异步 best-effort 鉴权命中时间戳；5min 批量 flush）
+
+---
+
+## 0005 演化（2026-05-29）
+
+> 计划：[异步视频中继 MVP plan](../plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md) Unit 2；决策 [ADR-0006](../adr/0006-async-execution-asynq-redis.md)
+
+### `task` 新增列
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `callback_token` | text NULL | 回调 per-task token（Unit 8 生成）；进终态后置空；绝不入日志 / 不放 query string |
+| `upstream_submitted_at` | timestamptz NULL | 进入 UPSTREAM_SUBMITTED 的时刻；供 fetch reconciler 判上游超时未终态 |
+
+### 新表：`account_model_concurrency`（R15 并发硬上限权威计数行）
+
+每 (account, model) 一行 `inflight` 计数；**claim = 上游并发槽**（只数 SUBMITTED/UPSTREAM_SUBMITTING/UPSTREAM_SUBMITTED 三态）。提交前原子占位 `UPDATE ... SET inflight=inflight+1 WHERE ... AND inflight<@cap RETURNING inflight`（影响 0 行 = 占不到 = 429）；进上游终态 CAS 同事务释放。详见 ADR-0006 决策 2。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `business_account_id` | text NOT NULL | 复合 PK + FK → business_account(id) ON DELETE CASCADE |
+| `model` | text NOT NULL | 复合 PK；gateway 可见 model 名 |
+| `inflight` | int NOT NULL DEFAULT 0 | 在途任务数；占位 +1 / 上游终态 -1 |
+| `updated_at` | timestamptz NOT NULL DEFAULT NOW() | |
+
+- **PK** `(business_account_id, model)`
+- **FK CASCADE** `business_account_id → business_account(id)`
+- **CHECK** `inflight >= 0`（防 double-release 为负；超上限由查询 `inflight < @cap` 保证，**cap 不入表**，由 Go 侧解析为查询参数）
+
+### 新表：`business_account_model_entitlement`（账户×模型授权）
+
+行存在 = 已授权；revoke = 删行；check = 存在性查询（计划 Unit 10）。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `business_account_id` | text NOT NULL | 复合 PK + FK → business_account(id) ON DELETE CASCADE |
+| `gateway_model` | text NOT NULL | 复合 PK；gateway 可见 model 名 |
+| `created_at` | timestamptz NOT NULL DEFAULT NOW() | |
+| `updated_at` | timestamptz NOT NULL DEFAULT NOW() | grant 幂等时刷新 |
+
+- **PK** `(business_account_id, gateway_model)`（天然唯一）
+- **FK CASCADE** `business_account_id → business_account(id)`
+
+### sqlc 生成代码
+
+- `internal/db/channel.sql.go`：InsertChannel / GetChannelByID / ListActiveChannels / ListActiveChannelsByProvider / UpdateChannelCredentials / SetChannelEnabled / DeleteChannel
+- `internal/db/task.sql.go`：InsertTask / GetTaskByID / GetTaskForAccount（归属校验）/ GetTaskByUpstreamTaskID / CompareAndSwapTaskStatus / MarkTaskSubmitting / MarkTaskUpstreamSubmitted / MarkTaskUpstreamTerminal / CountInflightByAccountModel / ScanRecoverableTasks / ScanStuckUpstreamSubmitted / ScanSubmittedNoJob / ScanExpirableTasks / ClaimConcurrencySlot / ReleaseConcurrencySlot / GetConcurrency
+- `internal/db/entitlement.sql.go`：GrantEntitlement（幂等）/ RevokeEntitlement / CheckEntitlement / ListEntitlementsByAccount
+
+---
+
+## 0006 演化（2026-05-29）
+
+> 计划：同上 Unit 2；决策 ADR-0006 决策 5
+
+### `task_status` 枚举扩展
+
+新增第 10 态 `SETTLE_FAILED`（沿用既有全大写约定）：
+
+```sql
+ALTER TYPE task_status ADD VALUE IF NOT EXISTS 'SETTLE_FAILED';
+```
+
+**用途**：上游已终态但结算失败（缺 usage / Poll 持续失败 / settle 重试耗尽）→ 落此终态 + 告警 + 进对账队列（不按 reserve 上界 commit、不静默 release）。**不持并发 claim**（claim 在进上游终态时已释放）。
+
+**PG 限制**：`ADD VALUE` 不能在同事务被使用（migrate 每文件 1 事务）；故独立成 0006，索引重建（使用该值）放 0007。`DROP VALUE` 不被支持，down 保留枚举值（无害）。
+
+---
+
+## 0007 演化（2026-05-29）
+
+> 计划：同上 Unit 2
+
+### 重建 `idx_task_inflight`
+
+终态排除谓词纳入 `SETTLE_FAILED`（须在 0006 ADD VALUE 之后的独立文件，否则同事务使用新枚举值报错）：
+
+```sql
+DROP INDEX IF EXISTS idx_task_inflight;
+CREATE INDEX idx_task_inflight ON task (business_account_id, status)
+    WHERE status NOT IN ('COMPLETED','FAILED','CANCELLED','EXPIRED','SETTLED','SETTLE_FAILED');
+```
+
+该索引仅供 reconciler 扫卡住任务 / metrics 聚合，**非** R15 cap 计数（cap 走 `account_model_concurrency` 原子 claim）。down 还原为 0001 的 5 终态排除谓词。

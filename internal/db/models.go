@@ -242,6 +242,7 @@ func (ns NullOutboxDeliveryStatus) Value() (driver.Value, error) {
 	return string(ns.OutboxDeliveryStatus), nil
 }
 
+// 任务状态机 10 态：SUBMITTED / UPSTREAM_SUBMITTING / UPSTREAM_SUBMITTED / COMPLETED / FAILED / CANCELLED / EXPIRED / SETTLING / SETTLED / SETTLE_FAILED（SETTLE_FAILED = 结算失败终态，不持并发 claim）
 type TaskStatus string
 
 const (
@@ -254,6 +255,7 @@ const (
 	TaskStatusEXPIRED            TaskStatus = "EXPIRED"
 	TaskStatusSETTLING           TaskStatus = "SETTLING"
 	TaskStatusSETTLED            TaskStatus = "SETTLED"
+	TaskStatusSETTLEFAILED       TaskStatus = "SETTLE_FAILED"
 )
 
 func (e *TaskStatus) Scan(src interface{}) error {
@@ -289,6 +291,15 @@ func (ns NullTaskStatus) Value() (driver.Value, error) {
 		return nil, nil
 	}
 	return string(ns.TaskStatus), nil
+}
+
+// R15 并发硬上限权威计数行（每账户×模型一行 inflight）；claim = 上游并发槽（ADR-0006 决策 2）
+type AccountModelConcurrency struct {
+	BusinessAccountID string `json:"business_account_id"`
+	Model             string `json:"model"`
+	// 在途任务数（SUBMITTED/UPSTREAM_SUBMITTING/UPSTREAM_SUBMITTED）；占位 +1 / 上游终态 -1；cap 由 Go 侧作查询参数
+	Inflight  int32     `json:"inflight"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // 业务账户：业务系统侧企业账户在网关侧的镜像（CONTEXT.md business_account）
@@ -373,6 +384,14 @@ type BusinessAccountLedger struct {
 	ActorID string `json:"actor_id"`
 	// 充值幂等命中时比对的 canonical body sha256；防沉默篡改
 	CanonicalBodySha256 []byte `json:"canonical_body_sha256"`
+}
+
+// 账户×模型授权；行存在 = 已授权，revoke = 删行，check = 存在性（计划 Unit 10）
+type BusinessAccountModelEntitlement struct {
+	BusinessAccountID string    `json:"business_account_id"`
+	GatewayModel      string    `json:"gateway_model"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // 渠道：一组上游 provider 凭据的抽象（CONTEXT.md channel）
@@ -485,6 +504,10 @@ type Task struct {
 	ErrorCode       pgtype.Text  `json:"error_code"`
 	ErrorMessage    pgtype.Text  `json:"error_message"`
 	UpdatedAt       time.Time    `json:"updated_at"`
+	// 回调 per-task 随机 token（Unit 8 生成）；进终态后置空；绝不入日志 / 不放 query string
+	CallbackToken pgtype.Text `json:"callback_token"`
+	// 进入 UPSTREAM_SUBMITTED 的时刻；供 fetch reconciler 判上游超时未终态
+	UpstreamSubmittedAt sql.NullTime `json:"upstream_submitted_at"`
 }
 
 // 事件出箱：与 ledger 同事务写入，业务系统拉取/重放游标（CONTEXT.md outbox）

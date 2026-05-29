@@ -1,0 +1,13 @@
+-- ============================================================================
+-- Migration 0006 DOWN: （无操作）
+-- ----------------------------------------------------------------------------
+-- PG 不支持 ALTER TYPE ... DROP VALUE。down 不删 SETTLE_FAILED 枚举值（残留无害）。
+--
+-- 完整回滚（运维 SOP，本 down 不自动做）：先确保无 task 处于 SETTLE_FAILED，再手工
+--   CREATE TYPE task_status_new AS ENUM(老 9 值) →
+--   ALTER TABLE task ALTER COLUMN status TYPE task_status_new USING status::text::task_status_new →
+--   DROP TYPE task_status → ALTER TYPE task_status_new RENAME TO task_status →
+--   重建依赖该类型的索引。MVP 接受残留枚举值。
+-- ============================================================================
+
+-- 故意留空（仅注释）：SETTLE_FAILED 枚举值保留。
