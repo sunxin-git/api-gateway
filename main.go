@@ -10,9 +10,10 @@
 //  7. **新增**：启动 ReconcilerController（goroutine + SIGUSR1 暂停 handler，仅 Unix）。
 //  8. 监听 SIGINT/SIGTERM，收到信号后 30s graceful shutdown，超时强制 Close。
 //
-// 优雅停机顺序（计划 Unit 10 §graceful shutdown）：
+// 优雅停机顺序（计划 Unit 10 §graceful shutdown；Unit 1 加入 Asynq）：
 //
-//	SIGTERM/INT → HTTP server.Shutdown (30s) → ReconcilerController.Stop → pgxpool.Close
+//	SIGTERM/INT → HTTP server.Shutdown (30s) → Asynq server.Shutdown（仅 AsyncEnabled）
+//	  → ReconcilerController.Stop → pgxpool.Close
 package main
 
 import (
@@ -32,6 +33,7 @@ import (
 
 	"github.com/sunxin-git/api-gateway/internal/admin"
 	"github.com/sunxin-git/api-gateway/internal/admintoken"
+	"github.com/sunxin-git/api-gateway/internal/asyncq"
 	"github.com/sunxin-git/api-gateway/internal/audit"
 	"github.com/sunxin-git/api-gateway/internal/businesskey"
 	"github.com/sunxin-git/api-gateway/internal/config"
@@ -212,6 +214,31 @@ func run() error {
 		logger.Info("RelayEnabled=false：admin-only 部署，/v1 业务路由未注册")
 	}
 
+	// 第 7ter 步：异步执行基座（Asynq + Redis；ADR-0006 / Unit 1）。仅 AsyncEnabled 时装配。
+	//   - Redis ping fail-fast（与 pgxpool 同风格；不可达即拒启动）
+	//   - server 起 worker goroutine 处理任务；当前 mux 为空，handler 在 Unit 6/8 注册
+	//   - AsyncEnabled=false 时完全不碰 Redis（现有 admin-only / 同步 relay 部署零 Redis 依赖）
+	var asyncSrv *asyncq.Server
+	if cfg.AsyncEnabled {
+		asyncSrv = asyncq.NewServer(asyncq.Config{
+			RedisAddr:   cfg.RedisAddr,
+			Concurrency: cfg.AsyncConcurrency,
+			Logger:      logger,
+		})
+		if err := asyncSrv.Ping(); err != nil {
+			return fmt.Errorf("Asynq/Redis 不可达（AsyncEnabled=true）: %w", err)
+		}
+		if err := asyncSrv.Start(asyncq.NewServeMux()); err != nil {
+			return fmt.Errorf("启动 Asynq server 失败: %w", err)
+		}
+		logger.Info("Asynq 异步基座已启动",
+			slog.String("redis_addr", cfg.RedisAddr),
+			slog.Int("concurrency", cfg.AsyncConcurrency),
+		)
+	} else {
+		logger.Info("AsyncEnabled=false：异步基座未启用，不连接 Redis")
+	}
+
 	// 第 8 步：启动 ReconcilerController（goroutine + SIGUSR1 handler；Windows 是 no-op）。
 	// parentCtx 用 Background：由 controller.Stop 终止，不依赖外部 signal ctx。
 	reconCtrl := ledger.NewReconcilerController(context.Background(), reconciler, logger, metrics)
@@ -245,21 +272,31 @@ func run() error {
 			// HTTP server 异常退出：仍按顺序 cleanup reconciler / pool 再返回。
 			logger.Error("HTTP server 异常退出，触发 cleanup",
 				slog.String("err", err.Error()))
+			if asyncSrv != nil {
+				asyncSrv.Shutdown()
+			}
 			reconCtrl.Stop()
 			return fmt.Errorf("HTTP server 异常退出: %w", err)
 		}
 		// serverErr 关闭但无 error → 正常 Shutdown 路径走过；继续 cleanup。
 	}
 
-	// graceful shutdown 顺序（计划 Unit 10）：
+	// graceful shutdown 顺序（计划 Unit 10；Unit 1 加入 Asynq）：
 	//  1. HTTP server.Shutdown（拒新连接 + 等存活请求完成，最长 30s）
-	//  2. ReconcilerController.Stop（cancel goroutine + cleanup signal handler）
-	//  3. pool.Close（defer，函数末尾执行）
+	//  2. Asynq server.Shutdown（停止取新任务 + 等在途 worker 完成；仅 AsyncEnabled）
+	//  3. ReconcilerController.Stop（cancel goroutine + cleanup signal handler）
+	//  4. pool.Close（defer，函数末尾执行）
+	// Asynq 在 pool.Close 之前停：worker（Unit 6 起）会用 DB，须先让其排空再关连接池。
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server 停机异常", slog.String("err", err.Error()))
 		// Shutdown 内部已调用 Close 兜底，这里只记录不再返回错误。
+	}
+
+	if asyncSrv != nil {
+		logger.Info("停止 Asynq server（等在途任务完成）")
+		asyncSrv.Shutdown()
 	}
 
 	reconCtrl.Stop()

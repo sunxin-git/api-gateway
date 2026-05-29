@@ -61,6 +61,18 @@ const (
 	keyRelayPriceInputPer1MMinor  = "gateway_relay_price_input_per_1m_minor"
 	keyRelayPriceOutputPer1MMinor = "gateway_relay_price_output_per_1m_minor"
 	keyRelayMaxContextTokens      = "gateway_relay_max_context_tokens"
+
+	// Phase 2 异步基座（ADR-0006 / Unit 1）新增。
+	// AsyncEnabled=false（默认）时不构造 Asynq server、不要求 Redis 可达（保持 admin-only /
+	// 同步 relay 部署零 Redis 依赖）；=true 时 main.go 对 Redis 做启动 ping fail-fast。
+	keyAsyncEnabled     = "gateway_async_enabled"
+	keyAsyncConcurrency = "gateway_async_concurrency"
+)
+
+// asyncConcurrency 上下界（仅 AsyncEnabled 时校验）。
+const (
+	minAsyncConcurrency = 1
+	maxAsyncConcurrency = 1000
 )
 
 // 环境模式常量。
@@ -154,6 +166,17 @@ type Config struct {
 	RelayPriceOutputPer1MMinor int64
 	// RelayMaxContextTokens 字典默认 max context（业务可传更小 max_tokens）。
 	RelayMaxContextTokens int32
+
+	// ===== Phase 2 异步基座（ADR-0006 / Unit 1）新增 =====
+
+	// AsyncEnabled 是否启用异步执行基座（Asynq + Redis），默认 false。
+	// =true 时 main.go 构造 Asynq server、对 Redis 做启动 ping fail-fast（与 pgxpool 同风格）。
+	// =false 时完全不碰 Redis（保持现有 admin-only / 同步 relay 部署零 Redis 依赖）。
+	AsyncEnabled bool
+
+	// AsyncConcurrency Asynq server worker 池大小，默认 10。
+	// 这是**执行层吞吐**（一次跑几个 job），非 R15 业务并发上限（后者走 DB 原子 claim，ADR-0006）。
+	AsyncConcurrency int
 }
 
 // Load 加载并校验配置。
@@ -177,6 +200,8 @@ func Load(envFilePath string) (*Config, error) {
 		keyFrontTLSAck:               "false",
 		keyRelayEnabled:              "false", // 默认 admin-only；显式 =true 开启 /v1 relay
 		keyRelayUpstreamProviderType: "openai_compat",
+		keyAsyncEnabled:              "false", // 默认不启用异步基座 → 零 Redis 依赖
+		keyAsyncConcurrency:          10,
 	}
 	if err := k.Load(mapProvider(defaults), nil); err != nil {
 		return nil, fmt.Errorf("加载默认值失败: %w", err)
@@ -248,6 +273,9 @@ func Load(envFilePath string) (*Config, error) {
 		RelayPriceInputPer1MMinor:  k.Int64(keyRelayPriceInputPer1MMinor),
 		RelayPriceOutputPer1MMinor: k.Int64(keyRelayPriceOutputPer1MMinor),
 		RelayMaxContextTokens:      int32(relayMaxCtx),
+
+		AsyncEnabled:     k.Bool(keyAsyncEnabled),
+		AsyncConcurrency: int(k.Int64(keyAsyncConcurrency)),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -312,6 +340,17 @@ func (c *Config) validate() error {
 	// ===== D-min Unit 7 fail-fast 校验 =====
 	if err := c.validateAdminSecurity(); err != nil {
 		return err
+	}
+
+	// ===== Phase 2 异步基座校验（仅 AsyncEnabled 时） =====
+	// Redis 可达性不在此校验：由 main.go 启动期 ping fail-fast（与 pgxpool 同风格）。
+	if c.AsyncEnabled {
+		if c.AsyncConcurrency < minAsyncConcurrency || c.AsyncConcurrency > maxAsyncConcurrency {
+			return fmt.Errorf(
+				"GATEWAY_ASYNC_CONCURRENCY 非法值 %d，启用异步基座时须在 [%d, %d] 区间",
+				c.AsyncConcurrency, minAsyncConcurrency, maxAsyncConcurrency,
+			)
+		}
 	}
 
 	return nil

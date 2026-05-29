@@ -33,6 +33,8 @@ func TestLoad默认值生效(t *testing.T) {
 	assert.Equal(t, "localhost:6379", cfg.RedisAddr)
 	assert.Equal(t, "stdout", cfg.OTelExporter)
 	assert.Empty(t, cfg.CORSAllowedOrigins, "默认应为空白名单 = 拒绝所有跨域")
+	assert.False(t, cfg.AsyncEnabled, "默认不启用异步基座")
+	assert.Equal(t, 10, cfg.AsyncConcurrency, "异步并发默认 10")
 }
 
 func TestLoad环境变量覆盖默认值(t *testing.T) {
@@ -332,6 +334,51 @@ func TestNormalizeEnv(t *testing.T) {
 	}
 }
 
+// =============================================================================
+// Phase 2 异步基座（ADR-0006 / Unit 1）
+// =============================================================================
+
+func TestAsync_EnabledValidConcurrency(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ASYNC_ENABLED", "true")
+	t.Setenv("GATEWAY_ASYNC_CONCURRENCY", "25")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.True(t, cfg.AsyncEnabled)
+	assert.Equal(t, 25, cfg.AsyncConcurrency)
+}
+
+func TestAsync_EnabledZeroConcurrencyFails(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ASYNC_ENABLED", "true")
+	t.Setenv("GATEWAY_ASYNC_CONCURRENCY", "0")
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_ASYNC_CONCURRENCY")
+}
+
+func TestAsync_EnabledTooHighConcurrencyFails(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ASYNC_ENABLED", "true")
+	t.Setenv("GATEWAY_ASYNC_CONCURRENCY", "5000")
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_ASYNC_CONCURRENCY")
+}
+
+func TestAsync_DisabledSkipsConcurrencyValidation(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	// AsyncEnabled 默认 false；即便 concurrency 非法（0）也不校验，照常启动。
+	t.Setenv("GATEWAY_ASYNC_CONCURRENCY", "0")
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.False(t, cfg.AsyncEnabled)
+}
+
 // clearGatewayEnv 清掉本测试关心的所有 env，避免外部环境干扰。
 func clearGatewayEnv(t *testing.T) {
 	t.Helper()
@@ -354,6 +401,9 @@ func clearGatewayEnv(t *testing.T) {
 		"GATEWAY_TLS_KEY_PATH",
 		"GATEWAY_TOKEN_PEPPER",
 		"ADMIN_AUDIT_HIGH_VALUE_LOG_PATH",
+		// Phase 2 异步基座
+		"GATEWAY_ASYNC_ENABLED",
+		"GATEWAY_ASYNC_CONCURRENCY",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
