@@ -152,6 +152,63 @@ ORDER BY submitted_at
 LIMIT @batch_size;
 
 
+-- name: ScanStuckSettling :many
+-- fetch reconciler（6b）：扫 SETTLING 滞留超阈值的任务——硬崩溃于 commit/release 落账后、
+-- 终态 CAS（SETTLING→SETTLED/SETTLE_FAILED）前，task 卡 SETTLING（钱可能已落账、态未终）。
+-- 调用方幂等重投 settle 恢复：先反查 active reserve 判钱是否已落账，已落账→直接 finalize SETTLED，
+-- 未落账→按 error_code 判 COMPLETED/失败重走结算（靠账本 ErrAlreadySettled / 反查收敛）。
+-- 用 idx_task_stuck_settling（0009）。阈值须 ≫ 正常 settle 端到端耗时，避免抢正在结算中的任务。
+SELECT * FROM task
+WHERE status = 'SETTLING'
+  AND updated_at < @threshold
+ORDER BY updated_at
+LIMIT @batch_size;
+
+
+-- ============================================================================
+-- 5. orphan reserve sweep（跨表：ledger active reserve 反查无对应 task 行）
+-- ============================================================================
+
+
+-- name: ScanOrphanVideoReserves :many
+-- orphan reserve sweep（6b / 计划 Unit 6 Approach）：扫 ledger 中尚未结算的视频任务 reserve
+-- （reference_type='video_task'）反查在 task 表无对应行者 → 调用方 Release 回退（无 orphan 占资金）。
+--   - 未结算：同 reserve 既无 commit、也无 release（注意账本写入约定：commit entry 记在 base
+--     correlation 下，**全额/残余 release entry 记在 correlation||':release' 下**——见 ledger
+--     postgres.go Release/CommitWithReleaseAtomic）。故须同时排除两者，否则已被本 sweep（或正常
+--     settleReleased）回退过的 reserve 因其 release 记在 ':release' 下而被反复误判为孤儿、每轮重扫。
+--   - 无 task 行：reference_id（= 提交时的 task_id）在 task 表不存在 = reserve 落了但 task tx 没成。
+--     reference_id IS NOT NULL 守卫：NULL 时 t.id = NULL 恒 false 会把 NULL-ref reserve 误判为孤儿。
+--   - @max_created_at = now - 最小年龄阈值：**只回收确陈旧者**，避免误回收 in-flight 窗口内
+--     「reserve 已落、claim+task tx 即将提交」的 reserve（否则该 task settle 反查不到 reserve →
+--     ErrReserveNotFound → 资金锁死）。阈值须 ≫ reserve→task tx 正常间隔（计划 Risks）。
+-- 复用 idx_ledger_reference (reference_type, reference_id) 过滤 video_task（MVP 视频 ledger 行少）。
+SELECT
+    l.business_account_id,
+    l.correlation_id,
+    l.amount,
+    l.reference_id,
+    l.created_at
+FROM business_account_ledger l
+WHERE l.entry_type     = 'reserve'
+  AND l.reference_type = 'video_task'
+  AND l.reference_id IS NOT NULL
+  AND l.created_at     < @max_created_at
+  AND NOT EXISTS (
+      SELECT 1 FROM business_account_ledger s
+      WHERE s.business_account_id = l.business_account_id
+        AND (
+              (s.correlation_id = l.correlation_id            AND s.entry_type = 'commit')
+           OR (s.correlation_id = l.correlation_id || ':release' AND s.entry_type = 'release')
+        )
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM task t WHERE t.id = l.reference_id
+  )
+ORDER BY l.created_at
+LIMIT @batch_size;
+
+
 -- ============================================================================
 -- 4. account_model_concurrency（R15 并发硬上限：原子 claim / release）
 -- ============================================================================

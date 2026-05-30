@@ -54,6 +54,22 @@ type Service struct {
 	pollTO time.Duration
 	// workerID 标识本进程（写入 submit_locked_by，便于排查）。
 	workerID string
+
+	// --- 6b sweep 阈值/批量（fetch reconciler / recover / expire / orphan 周期兜底）---
+	// submittedNoJobAge SUBMITTED 滞留多久判「入队丢失」→ 幂等重投 submit。
+	submittedNoJobAge time.Duration
+	// stuckUpstreamAge UPSTREAM_SUBMITTED 多久未终态 → 主动 Poll 上游兜底（回调缺失）。
+	stuckUpstreamAge time.Duration
+	// stuckSettlingAge SETTLING 多久未终态 → 崩溃恢复（硬崩溃于结算落账后、终态 CAS 前）。
+	//   须 ≫ 正常 settle 端到端耗时，避免抢「正在结算中」的任务。
+	stuckSettlingAge time.Duration
+	// maxExecutionAge 任务超最长执行期 → EXPIRED 兜底（seedance execution_expires_after 默认 48h）。
+	maxExecutionAge time.Duration
+	// orphanReserveMinAge 孤儿 reserve 最小年龄阈值：只回收确陈旧者，防误回收 in-flight 窗口内
+	//   reserve 已落、task tx 即将提交的 reserve（须 ≫ reserve→task tx 正常间隔）。
+	orphanReserveMinAge time.Duration
+	// sweepBatchSize 各 sweep 单轮扫描批量上限（防一轮处理过多阻塞）。
+	sweepBatchSize int32
 }
 
 // Config 构造 Service 的参数。
@@ -71,6 +87,14 @@ type Config struct {
 	SettleTimeout  time.Duration
 	PollTimeout    time.Duration
 	WorkerID       string
+
+	// 6b sweep 阈值/批量（零值回落默认；测试可注入小值）。
+	SubmittedNoJobAge   time.Duration
+	StuckUpstreamAge    time.Duration
+	StuckSettlingAge    time.Duration
+	MaxExecutionAge     time.Duration
+	OrphanReserveMinAge time.Duration
+	SweepBatchSize      int32
 }
 
 // 默认时长（Config 未给时回落）。
@@ -79,6 +103,17 @@ const (
 	defaultSettleTimeout  = 5 * time.Second
 	defaultPollTimeout    = 10 * time.Second
 	defaultConcurrencyCap = 5
+
+	// 6b sweep 默认阈值/批量。
+	defaultSubmittedNoJobAge = 2 * time.Minute
+	defaultStuckUpstreamAge  = 2 * time.Minute
+	// stuckSettlingAge 须安全 ≫ 单次 settle 最坏端到端耗时（pollTO 10s + commit/release 重试
+	// settleTO 5s×退避 + finalizeSettle 重试），留足余量避免抢「正在结算中」的任务（ce-review：
+	// 2m 余量偏窄，提至 5m）。代价仅：硬崩溃残留的 SETTLING 恢复延迟 5min（罕见，可接受）。
+	defaultStuckSettlingAge    = 5 * time.Minute
+	defaultMaxExecutionAge     = 48 * time.Hour // seedance execution_expires_after 默认 48h
+	defaultOrphanReserveMinAge = 15 * time.Minute
+	defaultSweepBatchSize      = 100
 )
 
 // NewService 构造 Service + fail-fast 必填校验。
@@ -106,6 +141,13 @@ func NewService(cfg Config) (*Service, error) {
 		settleTO:       cfg.SettleTimeout,
 		pollTO:         cfg.PollTimeout,
 		workerID:       cfg.WorkerID,
+
+		submittedNoJobAge:   cfg.SubmittedNoJobAge,
+		stuckUpstreamAge:    cfg.StuckUpstreamAge,
+		stuckSettlingAge:    cfg.StuckSettlingAge,
+		maxExecutionAge:     cfg.MaxExecutionAge,
+		orphanReserveMinAge: cfg.OrphanReserveMinAge,
+		sweepBatchSize:      cfg.SweepBatchSize,
 	}
 	if s.cap <= 0 {
 		s.cap = defaultConcurrencyCap
@@ -121,6 +163,24 @@ func NewService(cfg Config) (*Service, error) {
 	}
 	if s.workerID == "" {
 		s.workerID = "task-worker"
+	}
+	if s.submittedNoJobAge <= 0 {
+		s.submittedNoJobAge = defaultSubmittedNoJobAge
+	}
+	if s.stuckUpstreamAge <= 0 {
+		s.stuckUpstreamAge = defaultStuckUpstreamAge
+	}
+	if s.stuckSettlingAge <= 0 {
+		s.stuckSettlingAge = defaultStuckSettlingAge
+	}
+	if s.maxExecutionAge <= 0 {
+		s.maxExecutionAge = defaultMaxExecutionAge
+	}
+	if s.orphanReserveMinAge <= 0 {
+		s.orphanReserveMinAge = defaultOrphanReserveMinAge
+	}
+	if s.sweepBatchSize <= 0 {
+		s.sweepBatchSize = defaultSweepBatchSize
 	}
 	return s, nil
 }

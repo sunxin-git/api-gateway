@@ -15,7 +15,10 @@
 // 显式真相源，service 推进前用 canTransition 自检，杜绝非法转移。
 package task
 
-import "github.com/sunxin-git/api-gateway/internal/db"
+import (
+	"github.com/sunxin-git/api-gateway/internal/db"
+	"github.com/sunxin-git/api-gateway/internal/relay/video"
+)
 
 // allowedTransitions 任务状态机的合法 from→to 转移白名单（plan §High-Level Technical Design 状态机图）。
 //
@@ -80,5 +83,28 @@ func isUpstreamTerminal(s db.TaskStatus) bool {
 	return ok
 }
 
-// 注：upstreamStatusToTaskTerminal（video 上游状态→task 终态映射）+ isInflight 由 6b 的
-// fetch-reconciler/expire 引入并使用——6a 仅 submit/settle 路径，暂不需要，避免死代码。
+// upstreamStatusToTaskTerminal 把上游终态映射到对应的 task 上游终态（6b fetch reconciler 用）。
+//
+// 映射（与 allowedTransitions 的 UPSTREAM_SUBMITTED→{...} 出边一一对应）：
+//
+//	Succeeded → COMPLETED / Failed → FAILED / Cancelled → CANCELLED / Expired → EXPIRED
+//
+// 非终态（Running，含未知/空状态被 adapter 归一为 Running）返回 (_, false)：调用方据此**跳过**
+// （不提前终态——继续轮询，超最长执行期由 expire worker 兜底，fail-safe）。
+//
+// 注：isInflight（计划提到的另一 helper）6b 未引入——各 sweep 的「在途」判定已由 SQL scan 的
+// status 谓词承载（ScanStuck* / ScanExpirableTasks），Go 侧再加一个等价判定属冗余，故省（避免死代码）。
+func upstreamStatusToTaskTerminal(s video.UpstreamStatus) (db.TaskStatus, bool) {
+	switch s {
+	case video.UpstreamSucceeded:
+		return db.TaskStatusCOMPLETED, true
+	case video.UpstreamFailed:
+		return db.TaskStatusFAILED, true
+	case video.UpstreamCancelled:
+		return db.TaskStatusCANCELLED, true
+	case video.UpstreamExpired:
+		return db.TaskStatusEXPIRED, true
+	default:
+		return "", false
+	}
+}

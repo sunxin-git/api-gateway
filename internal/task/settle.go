@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/sunxin-git/api-gateway/internal/db"
 	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/relay/video"
@@ -111,6 +113,79 @@ func (s *Service) settleReleased(t db.Task, snap TaskFinancialSnapshot) error {
 	return s.casSettled(t.ID)
 }
 
+// =============================================================================
+// SETTLING 崩溃恢复（6b fetch reconciler 调用；与正常 settle 的 SETTLING→no-op 路径分离）
+// =============================================================================
+
+// recoverSettling 恢复**卡住**的 SETTLING 任务（硬崩溃于 commit/release 落账后、终态 CAS 前）。
+//
+// 仅由 6b fetch reconciler 经 ScanStuckSettling（updated_at 超阈值）筛出的任务调用——阈值已
+// 排除「正在被某 worker 结算中」的任务，故这里处理的是进程崩溃残留（钱可能已落账、态卡 SETTLING）。
+// **不**走 settleTask 的 SETTLING→no-op 分支（那是给「他人正在结算」的去抖，不做恢复）。
+//
+// 钱是否已落账无法从 task 行直接判定（CAS terminal→SETTLING 已覆盖原上游终态）→ 按 error_code
+// 判原上游终态，分两路恢复（各自幂等）：
+//
+//   - **失败终态**（error_code 非空）：直接重走 settleReleased。ledger.Release 自身幂等——命中既有
+//     release entry 即返成功（settleReleased 视 err==nil → casSettled）；未 release 则全额回退。
+//     **不预判**钱是否已落账：ledger 全额 release 的 entry 记在 `correlation+":release"` 下，
+//     用 base correlation 的 FindActiveReserveByCorrelation 反查不到（会误判仍 active），故对 release
+//     路径不可用此探针；靠 ledger.Release 的 :release 幂等检查即可。
+//   - **COMPLETED**（error_code 空）：commit 路径。先用 FindActiveReserveByCorrelation(base) 探针判
+//     是否已 commit——commit entry 记在 base correlation 下，已 commit 则反查 ErrNoRows → 直接
+//     finalize SETTLED（**避免无谓 Poll**：钱已 commit 时 Poll 失败会误落 settle_failed）；
+//     未 commit（active）则重走 settleCompleted（Poll 真实 usage → commit，ErrAlreadySettled 兜底）。
+//
+// 不变量依赖（与 markUpstreamTerminal / sweep.go 写入约定一致）：**COMPLETED ⟺ error_code 为空**；
+// 失败终态（FAILED/CANCELLED/EXPIRED）一律写非空 error_code。
+func (s *Service) recoverSettling(ctx context.Context, t db.Task) error {
+	snap, err := ParseSnapshot(t.FinancialSnapshot)
+	if err != nil {
+		s.logger.Error("task.recoverSettling: 快照损坏 → settle_failed",
+			slog.String("task_id", t.ID), slog.String("err", err.Error()))
+		return s.casSettleFailed(t.ID)
+	}
+
+	// 失败终态：release 路径（ledger.Release 自身幂等，重走安全）。
+	if t.ErrorCode.Valid && t.ErrorCode.String != "" {
+		return s.settleReleased(t, snap)
+	}
+
+	// COMPLETED：先探针判是否已 commit（commit entry 在 base correlation 下，反查可靠；
+	// 注意此探针对 release 路径不可靠——release 记在 ':release' 下——但 COMPLETED 永不走 release，
+	// 故对本分支安全，见上方失败终态分支已分流）。
+	_, err = s.q.FindActiveReserveByCorrelation(ctx, db.FindActiveReserveByCorrelationParams{
+		BusinessAccountID: t.BusinessAccountID,
+		CorrelationID:     snap.ReservationCorrelationID,
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// reserve 不再 active：可能已 commit（→ finalize SETTLED），也可能该 correlation 从无 reserve
+		// （异常：correlation 错乱 / 快照损坏）。二次反查区分（对齐 ledger.Commit 的 Active/Any 两段判定，
+		// 显式优于隐式）：确有 reserve（已 commit）→ SETTLED；无任何 reserve → settle_failed 交对账，
+		// **绝不**静默 SETTLED（否则会把「无任何资金动作」的任务标成功，掩盖账务异常）。
+		if _, anyErr := s.q.FindAnyReserveByCorrelation(ctx, db.FindAnyReserveByCorrelationParams{
+			BusinessAccountID: t.BusinessAccountID,
+			CorrelationID:     snap.ReservationCorrelationID,
+		}); errors.Is(anyErr, pgx.ErrNoRows) {
+			s.logger.Error("task.recoverSettling: COMPLETED 但该 correlation 无任何 reserve（异常）→ settle_failed 交对账",
+				slog.String("task_id", t.ID), slog.String("correlation_id", snap.ReservationCorrelationID))
+			return s.casSettleFailed(t.ID)
+		} else if anyErr != nil && !errors.Is(anyErr, pgx.ErrNoRows) {
+			return fmt.Errorf("task.recoverSettling 反查 any reserve: %w", anyErr) // 瞬时 → 下轮重试
+		}
+		s.logger.Warn("task.recoverSettling: COMPLETED reserve 已 commit、仅缺终态 CAS → finalize SETTLED",
+			slog.String("task_id", t.ID))
+		return s.casSettled(t.ID)
+	case err == nil:
+		// reserve 仍 active → 尚未 commit（崩溃在 commit 前）→ 重走 settleCompleted。
+		return s.settleCompleted(t, snap)
+	default:
+		// 反查瞬时失败 → 返 error 交下一轮 reconciler 重试（不强推终态）。
+		return fmt.Errorf("task.recoverSettling 反查 active reserve: %w", err)
+	}
+}
+
 // pollUsage settle 内独立 ctx Poll 反查上游真实 usage；nil = 缺 usage / Poll 失败（交 settle_failed）。
 func (s *Service) pollUsage(t db.Task, snap TaskFinancialSnapshot) *video.UpstreamUsage {
 	if !t.UpstreamTaskID.Valid || t.UpstreamTaskID.String == "" {
@@ -167,13 +242,13 @@ func (s *Service) finalizeSettle(taskID string, to db.TaskStatus) error {
 			}
 		}
 		// affected 0（已被推进）/ 1（本次推进）均算成功；仅 DB error 重试。
-		if _, err := s.q.CompareAndSwapTaskStatus(ctx, db.CompareAndSwapTaskStatusParams{
+		_, err := s.q.CompareAndSwapTaskStatus(ctx, db.CompareAndSwapTaskStatusParams{
 			ToStatus: to, ID: taskID, FromStatus: db.TaskStatusSETTLING,
-		}); err == nil {
+		})
+		if err == nil {
 			return nil
-		} else {
-			lastErr = err
 		}
+		lastErr = err
 	}
 	s.logger.Error("task.settle: 推进 SETTLING→终态永久失败；task 卡 SETTLING（钱已落账），待 6b reconciler 兜底",
 		slog.String("task_id", taskID), slog.String("to", string(to)), slog.String("err", lastErr.Error()))

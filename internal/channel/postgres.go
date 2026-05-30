@@ -201,6 +201,8 @@ func (s *PostgresService) GetCredentialsForUpstream(ctx context.Context, id int6
 
 // encryptCreds marshal 凭据为 JSON 后整体加密；返回密文 + 所用 KEK 版本。
 func (s *PostgresService) encryptCreds(creds ChannelCredentials) ([]byte, int32, error) {
+	// #nosec G117 -- 明文 JSON 仅用于立即 AES-GCM 加密（下方 keyring.Encrypt），blob 不落盘/不入日志/即用即弃；
+	// 这正是信封加密的预期路径，非明文凭据泄露（ADR-0006 决策 4）。
 	blob, err := json.Marshal(creds)
 	if err != nil {
 		return nil, 0, fmt.Errorf("序列化凭据失败: %w", err)

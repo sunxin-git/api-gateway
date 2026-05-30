@@ -37,13 +37,17 @@ import (
 	"github.com/sunxin-git/api-gateway/internal/asyncq"
 	"github.com/sunxin-git/api-gateway/internal/audit"
 	"github.com/sunxin-git/api-gateway/internal/businesskey"
+	"github.com/sunxin-git/api-gateway/internal/channel"
 	"github.com/sunxin-git/api-gateway/internal/config"
+	"github.com/sunxin-git/api-gateway/internal/crypto"
 	"github.com/sunxin-git/api-gateway/internal/httpapi"
 	"github.com/sunxin-git/api-gateway/internal/httpapi/middleware"
 	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/obs"
 	"github.com/sunxin-git/api-gateway/internal/outbox"
 	"github.com/sunxin-git/api-gateway/internal/relay"
+	"github.com/sunxin-git/api-gateway/internal/relay/video"
+	"github.com/sunxin-git/api-gateway/internal/task"
 )
 
 // 通过 ldflags 注入；Phase 1 默认值。
@@ -224,6 +228,8 @@ func run() error {
 	//   - server 起 worker goroutine 处理任务；当前 mux 为空，handler 在 Unit 6/8 注册
 	//   - AsyncEnabled=false 时完全不碰 Redis（现有 admin-only / 同步 relay 部署零 Redis 依赖）
 	var asyncSrv *asyncq.Server
+	var videoScheduler *asyncq.Scheduler
+	var videoEnqueuer *task.AsynqEnqueuer
 	if cfg.AsyncEnabled {
 		asyncSrv = asyncq.NewServer(asyncq.Config{
 			RedisAddr:       cfg.RedisAddr,
@@ -234,23 +240,64 @@ func run() error {
 			Logger:          logger,
 		})
 		// Redis ping fail-fast，带超时（评审 #3：asynq Ping 自身无 deadline）。
+		// Scheduler 复用同一 Redis，无需再 ping。
 		pingCtx, pingCancel := context.WithTimeout(context.Background(), redisPingTimeout)
 		pingErr := asyncSrv.PingContext(pingCtx)
 		pingCancel()
 		if pingErr != nil {
 			return fmt.Errorf("Asynq/Redis 不可达（AsyncEnabled=true）: %w", pingErr)
 		}
-		// 当前 mux 为空，handler 在 Unit 6/8 注册（届时 worker 装配 channel.Service +
-		// crypto.Keyring：crypto.DecodeKEK(cfg.GatewayKEKV1) → crypto.NewKeyring → channel.NewPostgresService）。
-		if err := asyncSrv.Start(asynq.NewServeMux()); err != nil {
+
+		// 视频异步任务闭环（Unit 6）：仅 VideoRelayEnabled 时装配 submit/settle/sweep handler +
+		// 周期 sweep scheduler。VideoRelayEnabled ⟹ AsyncEnabled（config.validate 已保证），故在此嵌套。
+		mux := asynq.NewServeMux()
+		if cfg.VideoRelayEnabled {
+			taskSvc, enq, err := buildVideoTaskService(cfg, pool, ledgerSvc, logger)
+			if err != nil {
+				asyncSrv.Shutdown()
+				return fmt.Errorf("装配视频异步任务 service 失败: %w", err)
+			}
+			videoEnqueuer = enq
+			taskSvc.RegisterHandlers(mux)
+
+			videoScheduler = asyncq.NewScheduler(asyncq.Config{
+				RedisAddr:       cfg.RedisAddr,
+				RedisPassword:   cfg.RedisPassword,
+				RedisTLSEnabled: cfg.RedisTLSEnabled,
+				Logger:          logger,
+			})
+			if err := registerVideoSweepSchedule(videoScheduler); err != nil {
+				_ = videoEnqueuer.Close()
+				asyncSrv.Shutdown()
+				return fmt.Errorf("注册视频 sweep 周期任务失败: %w", err)
+			}
+		}
+
+		if err := asyncSrv.Start(mux); err != nil {
 			asyncSrv.Shutdown() // 评审 #7：Start 失败也要停已起的内部 goroutine
+			if videoEnqueuer != nil {
+				_ = videoEnqueuer.Close()
+			}
 			return fmt.Errorf("启动 Asynq server 失败: %w", err)
 		}
 		logger.Info("Asynq 异步基座已启动",
 			slog.String("redis_addr", cfg.RedisAddr),
 			slog.Int("concurrency", cfg.AsyncConcurrency),
 			slog.Bool("redis_tls", cfg.RedisTLSEnabled),
+			slog.Bool("video_relay", cfg.VideoRelayEnabled),
 		)
+
+		// server 起来后再启动 scheduler（worker 已就绪，避免 sweep job 入队后无人取）。
+		if videoScheduler != nil {
+			if err := videoScheduler.Start(); err != nil {
+				videoScheduler.Shutdown()
+				asyncSrv.Shutdown()
+				_ = videoEnqueuer.Close()
+				return fmt.Errorf("启动视频 sweep scheduler 失败: %w", err)
+			}
+			logger.Info("视频异步任务闭环已启动（submit/settle handler + 周期兜底 sweep）",
+				slog.String("gateway_model", cfg.VideoRelayModelName))
+		}
 	} else {
 		logger.Info("AsyncEnabled=false：异步基座未启用，不连接 Redis")
 	}
@@ -288,23 +335,20 @@ func run() error {
 			// HTTP server 异常退出：仍按顺序 cleanup reconciler / pool 再返回。
 			logger.Error("HTTP server 异常退出，触发 cleanup",
 				slog.String("err", err.Error()))
-			if asyncSrv != nil {
-				if ok := asyncSrv.ShutdownWithTimeout(asynqShutdownTimeout); !ok {
-					logger.Error("Asynq server 停机超时（异常退出路径），强制继续",
-						slog.Duration("timeout", asynqShutdownTimeout))
-				}
-			}
+			shutdownAsyncStack(asyncSrv, videoScheduler, videoEnqueuer, asynqShutdownTimeout, logger)
 			reconCtrl.Stop()
 			return fmt.Errorf("HTTP server 异常退出: %w", err)
 		}
 		// serverErr 关闭但无 error → 正常 Shutdown 路径走过；继续 cleanup。
 	}
 
-	// graceful shutdown 顺序（计划 Unit 10；Unit 1 加入 Asynq）：
+	// graceful shutdown 顺序（计划 Unit 10；Unit 1 加入 Asynq；Unit 6b 加入 scheduler + enqueuer）：
 	//  1. HTTP server.Shutdown（拒新连接 + 等存活请求完成，最长 30s）
-	//  2. Asynq server.Shutdown（停止取新任务 + 等在途 worker 完成；仅 AsyncEnabled）
-	//  3. ReconcilerController.Stop（cancel goroutine + cleanup signal handler）
-	//  4. pool.Close（defer，函数末尾执行）
+	//  2. video sweep scheduler.Shutdown（停止入队新周期任务；仅 VideoRelayEnabled）
+	//  3. Asynq server.Shutdown（停止取新任务 + 等在途 worker 完成；仅 AsyncEnabled）
+	//  4. video enqueuer.Close（worker 已排空，关底层 client；仅 VideoRelayEnabled）
+	//  5. ReconcilerController.Stop（cancel goroutine + cleanup signal handler）
+	//  6. pool.Close（defer，函数末尾执行）
 	// Asynq 在 pool.Close 之前停：worker（Unit 6 起）会用 DB，须先让其排空再关连接池。
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
@@ -313,13 +357,7 @@ func run() error {
 		// Shutdown 内部已调用 Close 兜底，这里只记录不再返回错误。
 	}
 
-	if asyncSrv != nil {
-		logger.Info("停止 Asynq server（等在途任务完成）")
-		if ok := asyncSrv.ShutdownWithTimeout(asynqShutdownTimeout); !ok {
-			logger.Error("Asynq server 停机超时，强制继续 cleanup",
-				slog.Duration("timeout", asynqShutdownTimeout))
-		}
-	}
+	shutdownAsyncStack(asyncSrv, videoScheduler, videoEnqueuer, asynqShutdownTimeout, logger)
 
 	reconCtrl.Stop()
 
@@ -591,4 +629,154 @@ func registerBusinessRoutes(
 		middleware.BusinessAudit(auditLogger, m.AdminAuditWriteFailedTotal),
 	)
 	g.POST("/chat/completions", h.ChatCompletion)
+}
+
+// =============================================================================
+// Phase 2 Unit 6 helpers（视频异步任务闭环装配）
+// =============================================================================
+
+// 视频 sweep 周期（cron 描述符；执行隔离 / 兜底频率，**非**业务硬上限）。Unique TTL ≈ 周期，
+// 防多副本各自 Scheduler 在同一窗口重复入队同一 sweep（sweep 是幂等全表扫描，一窗一 job 足矣）。
+const (
+	sweepFetchInterval   = "@every 30s" // 回调缺失 / 入队丢失 / 卡 SETTLING 的轮询兜底（时效较敏感）
+	sweepRecoverInterval = "@every 1m"  // 崩溃恢复 fail-closed（lease 过期才动）
+	sweepExpireInterval  = "@every 5m"  // 终态收敛兜底（最长执行期 48h，低频足矣）
+	sweepOrphanInterval  = "@every 5m"  // 孤儿 reserve 回收（低频）
+)
+
+// shutdownAsyncStack 按序停止视频异步栈（停机 / 异常退出共用，避免两处重复）：
+//
+//  1. scheduler.Shutdown：先停，不再入队新 sweep job
+//  2. server.ShutdownWithTimeout：等在途 worker 排空（worker 可能仍经 enqueuer 入队 settle）
+//  3. enqueuer.Close：worker 已排空，关底层 asynq client
+//
+// 各参数允许为 nil（AsyncEnabled=false / VideoRelayEnabled=false 时部分未装配）。
+func shutdownAsyncStack(
+	asyncSrv *asyncq.Server,
+	sched *asyncq.Scheduler,
+	enq *task.AsynqEnqueuer,
+	timeout time.Duration,
+	logger *slog.Logger,
+) {
+	if sched != nil {
+		logger.Info("停止视频 sweep scheduler（停止入队新周期任务）")
+		sched.Shutdown()
+	}
+	if asyncSrv != nil {
+		logger.Info("停止 Asynq server（等在途任务完成）")
+		if ok := asyncSrv.ShutdownWithTimeout(timeout); !ok {
+			logger.Error("Asynq server 停机超时，强制继续 cleanup", slog.Duration("timeout", timeout))
+		}
+	}
+	if enq != nil {
+		if err := enq.Close(); err != nil {
+			logger.Error("关闭 video enqueuer client 失败", slog.String("err", err.Error()))
+		}
+	}
+}
+
+// buildVideoTaskService 装配视频异步任务 service（Unit 6 装配链）：
+//
+//	keyring(GATEWAY_KEK_V1) → channel.Service(凭据解密) → video catalog + seedance adapter →
+//	  task.Service(提交流程 + 状态机 CAS + settle + sweep) + AsynqEnqueuer(submit/settle 入队)
+//
+// 返回 enqueuer 供停机序列在 server 排空后 Close。任一 fail-fast 校验失败拒启动（catalog 自洽校验
+// 在 NewEnvVideoCatalog 内，与 RelayEnabled 同分工）。
+func buildVideoTaskService(
+	cfg *config.Config,
+	pool *pgxpool.Pool,
+	ledgerSvc ledger.Service,
+	log *slog.Logger,
+) (*task.Service, *task.AsynqEnqueuer, error) {
+	keyring, err := buildKeyring(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("装配凭据 keyring: %w", err)
+	}
+	channelSvc := channel.NewPostgresService(pool, keyring, log)
+
+	catalog, err := video.NewEnvVideoCatalog(video.CatalogConfig{
+		GatewayModelName:       cfg.VideoRelayModelName,
+		UpstreamProviderType:   cfg.VideoRelayProviderType,
+		UpstreamBaseURL:        cfg.VideoRelayUpstreamBaseURL,
+		UpstreamModelName:      cfg.VideoRelayUpstreamModelName,
+		ChannelName:            cfg.VideoRelayChannelName,
+		RequireHTTPS:           cfg.GatewayEnv == config.EnvProduction,
+		Price480pPer1MMinor:    cfg.VideoRelayPrice480pPer1MMinor,
+		Price720pPer1MMinor:    cfg.VideoRelayPrice720pPer1MMinor,
+		Price1080pPer1MMinor:   cfg.VideoRelayPrice1080pPer1MMinor,
+		BillingMultiplierBP:    cfg.VideoRelayBillingMultiplierBP,
+		DurationMinSeconds:     cfg.VideoRelayDurationMinSeconds,
+		DurationMaxSeconds:     cfg.VideoRelayDurationMaxSeconds,
+		DurationDefaultSeconds: cfg.VideoRelayDurationDefaultSeconds,
+		FpsDefault:             cfg.VideoRelayFpsDefault,
+		FpsMax:                 cfg.VideoRelayFpsMax,
+		Ratios:                 cfg.VideoRelayRatios,
+		RatioDefault:           cfg.VideoRelayRatioDefault,
+		ResolutionDefault:      cfg.VideoRelayResolutionDefault,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("装配 video catalog: %w", err)
+	}
+
+	// 上游 HTTP 客户端：总超时兜底（单次 Submit/Poll 由 ctx deadline 控制，见 task.Service 超时配置）。
+	// 禁止跟随重定向（defense-in-depth：上游被劫持 / DNS 污染时防二次 SSRF 到内网；可信 Ark endpoint
+	// 正常不重定向，3xx 交由 adapter 当非 2xx 分类，见 seedance_adapter doc）。
+	videoUpstreamClient := &http.Client{
+		Timeout: upstreamHTTPTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	adapter := video.NewSeedanceAdapter(videoUpstreamClient)
+
+	enqueuer := task.NewAsynqEnqueuer(asyncq.NewClient(asyncq.Config{
+		RedisAddr:       cfg.RedisAddr,
+		RedisPassword:   cfg.RedisPassword,
+		RedisTLSEnabled: cfg.RedisTLSEnabled,
+	}))
+
+	svc, err := task.NewService(task.Config{
+		Pool:     pool,
+		Ledger:   ledgerSvc,
+		Adapter:  adapter,
+		Catalog:  catalog,
+		Creds:    channelSvc,
+		Enqueuer: enqueuer,
+		Logger:   log,
+		WorkerID: hostnameOrUnknown(),
+		// ConcurrencyCap + 各超时 / sweep 阈值用 task 包默认（Unit 8 接入 per-account×model 覆写）。
+	})
+	if err != nil {
+		_ = enqueuer.Close()
+		return nil, nil, fmt.Errorf("构造 task.Service: %w", err)
+	}
+	return svc, enqueuer, nil
+}
+
+// buildKeyring 从 cfg.GatewayKEKV1 装配单版本 KEK keyring（ADR-0006 决策 4；P1 扩多版本 V2…）。
+func buildKeyring(cfg *config.Config) (*crypto.Keyring, error) {
+	kekV1, err := crypto.DecodeKEK(cfg.GatewayKEKV1)
+	if err != nil {
+		return nil, fmt.Errorf("解码 GATEWAY_KEK_V1: %w", err)
+	}
+	return crypto.NewKeyring(map[int32][]byte{1: kekV1})
+}
+
+// registerVideoSweepSchedule 把 4 个周期 sweep 注册到 scheduler（QueueLow；Unique 防多副本重复入队）。
+func registerVideoSweepSchedule(sched *asyncq.Scheduler) error {
+	entries := []struct {
+		cron, typ string
+		uniqueTTL time.Duration
+	}{
+		{sweepFetchInterval, task.TypeReconcileFetch, 30 * time.Second},
+		{sweepRecoverInterval, task.TypeRecover, 1 * time.Minute},
+		{sweepExpireInterval, task.TypeExpire, 5 * time.Minute},
+		{sweepOrphanInterval, task.TypeOrphanReserve, 5 * time.Minute},
+	}
+	for _, e := range entries {
+		if _, err := sched.Register(e.cron, e.typ, asyncq.QueueLow, e.uniqueTTL); err != nil {
+			return fmt.Errorf("注册 sweep %q: %w", e.typ, err)
+		}
+	}
+	return nil
 }

@@ -15,11 +15,21 @@ import (
 	"github.com/sunxin-git/api-gateway/internal/relay/video"
 )
 
-// Asynq task 类型（payload 仅 task_id，worker 从 task 行加载其余——存活于 job 丢失，
-// 6b reconciler 可从行重投，无需把请求塞进 payload）。
+// Asynq task 类型。
+//
+// submit/settle：payload 仅 task_id（worker 从 task 行加载其余——job 丢失时 6b reconciler 可从
+// 行重投，无需把请求塞进 payload）。
+// 6b sweep（reconcile-fetch/recover/expire/orphan-reserve）：payload 空，由 asynq Scheduler 定时
+// 入队（QueueLow），handler 直接跑全表 scan（非按 task 定向）。
 const (
 	TypeSubmit = "video:submit"
 	TypeSettle = "video:settle"
+
+	// 6b 周期兜底 sweep 类型（main.go 用 asynq Scheduler 注册 cron → 入队 → 下列 handler）。
+	TypeReconcileFetch = "video:reconcile-fetch"
+	TypeRecover        = "video:recover"
+	TypeExpire         = "video:expire"
+	TypeOrphanReserve  = "video:orphan-reserve"
 )
 
 // taskIDPayload submit/settle job 的 payload（仅 task_id）。
@@ -75,10 +85,37 @@ func (e *AsynqEnqueuer) EnqueueSettle(ctx context.Context, taskID string) error 
 	return e.enqueue(ctx, TypeSettle, taskID, asyncq.QueueCritical)
 }
 
-// RegisterHandlers 把 submit/settle handler 注册到 asynq mux（main.go 装配；6b 再加 sweep 周期任务）。
+// Close 关闭底层 asynq client（main.go 停机序列在 Asynq server 停机后调用，确保 worker 已排空）。
+func (e *AsynqEnqueuer) Close() error { return e.client.Close() }
+
+// RegisterHandlers 把本 Service 的全部 asynq handler 注册到 mux（main.go 装配）：
+//   - submit / settle：按 task_id 定向（Service.Submit / markUpstreamTerminal 入队）。
+//   - 6b 周期 sweep：由 asynq Scheduler 定时入队（见 main.go），handler 跑全表 scan。
 func (s *Service) RegisterHandlers(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeSubmit, s.HandleSubmit)
 	mux.HandleFunc(TypeSettle, s.HandleSettle)
+	mux.HandleFunc(TypeReconcileFetch, s.HandleReconcileFetch)
+	mux.HandleFunc(TypeRecover, s.HandleRecover)
+	mux.HandleFunc(TypeExpire, s.HandleExpire)
+	mux.HandleFunc(TypeOrphanReserve, s.HandleOrphanReserve)
+}
+
+// HandleReconcileFetch / HandleRecover / HandleExpire / HandleOrphanReserve 是 6b 周期 sweep 的
+// asynq 入口（payload 空，忽略；返回 error 让 asynq 记录，下一 tick 自然重试）。
+func (s *Service) HandleReconcileFetch(ctx context.Context, _ *asynq.Task) error {
+	return s.fetchReconcileOnce(ctx)
+}
+
+func (s *Service) HandleRecover(ctx context.Context, _ *asynq.Task) error {
+	return s.recoverOnce(ctx)
+}
+
+func (s *Service) HandleExpire(ctx context.Context, _ *asynq.Task) error {
+	return s.expireOnce(ctx)
+}
+
+func (s *Service) HandleOrphanReserve(ctx context.Context, _ *asynq.Task) error {
+	return s.orphanReserveSweepOnce(ctx)
 }
 
 // HandleSubmit submit job 入口（解 payload → handleSubmit）。
