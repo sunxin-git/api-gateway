@@ -48,6 +48,7 @@ const (
 	maskSet       = "已设置"
 	maskUnset     = "（未设置）"
 	maskDecFailed = "（解密失败）"
+	maskListOmit  = "（列表省略，见详情）"
 	maskPrefixLen = 6 // 前缀掩码保留位数
 )
 
@@ -81,6 +82,22 @@ func maskedDecryptFailed() MaskedCredentials {
 	}
 }
 
+// maskedListOmitted 返回列表视图的占位（评审 #10：List 不逐行解密，避免热路径 O(N) AES-GCM）。
+// 单条详情走 GetByID（解密产出真实掩码），路由取明文走 GetCredentialsForUpstream。
+func maskedListOmitted() MaskedCredentials {
+	return MaskedCredentials{
+		APIKey:       maskListOmit,
+		ARKAccessKey: maskListOmit,
+		ARKSecretKey: maskListOmit,
+		TOSAccessKey: maskListOmit,
+		TOSSecretKey: maskListOmit,
+		TOSBucket:    maskListOmit,
+		TOSEndpoint:  maskListOmit,
+		TOSRegion:    maskListOmit,
+		ProjectID:    maskListOmit,
+	}
+}
+
 // maskSecret 密钥类字段：固定占位，绝不回显任何明文片段。
 func maskSecret(s string) string {
 	if strings.TrimSpace(s) == "" {
@@ -89,14 +106,16 @@ func maskSecret(s string) string {
 	return maskSet
 }
 
-// maskPrefix 半公开标识：保留前 maskPrefixLen 位 + ***（便于运维识别）。
+// maskPrefix 半公开标识：保留前 maskPrefixLen 个字符 + ***（便于运维识别）。
 // 过短（≤ maskPrefixLen）视同机密，退回固定占位，避免泄露完整短串。
+// 用 []rune 而非字节切片，避免多字节 UTF-8 标识符（如含中文的 project_id）被切出非法序列（评审 #14）。
 func maskPrefix(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return maskUnset
 	}
-	if len(s) <= maskPrefixLen {
+	runes := []rune(s)
+	if len(runes) <= maskPrefixLen {
 		return maskSet
 	}
-	return s[:maskPrefixLen] + "***"
+	return string(runes[:maskPrefixLen]) + "***"
 }

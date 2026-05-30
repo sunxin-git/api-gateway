@@ -1,6 +1,7 @@
 package asyncq
 
 import (
+	"bytes"
 	"log/slog"
 	"os"
 	"testing"
@@ -72,8 +73,29 @@ func TestNewServerWithLogger(t *testing.T) {
 	require.NotNil(t, s)
 }
 
-func TestNewServeMuxNonNil(t *testing.T) {
-	require.NotNil(t, NewServeMux())
+// TestSlogAdapterFatalDoesNotExit：slogAdapter.Fatal 必须降级为 slog.Error，**不** os.Exit（评审 #13）。
+// 若本测试导致进程退出，测试运行器会判失败——这正是我们要防的回归。
+func TestSlogAdapterFatalDoesNotExit(t *testing.T) {
+	var buf bytes.Buffer
+	a := slogAdapter{l: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	a.Fatal("boom", 42)
+	out := buf.String()
+	assert.Contains(t, out, "asynq_level=fatal", "Fatal 应标记 fatal 级别")
+	assert.Contains(t, out, "boom", "应含原始消息")
+	// 各级别不 panic
+	a.Debug("d")
+	a.Info("i")
+	a.Warn("w")
+	a.Error("e")
+}
+
+func TestConfigRedisOptAuthTLS(t *testing.T) {
+	cfg := Config{RedisAddr: "h:6379", RedisPassword: "pw", RedisTLSEnabled: true}
+	opt := cfg.redisOpt()
+	assert.Equal(t, "pw", opt.Password)
+	require.NotNil(t, opt.TLSConfig, "启用 TLS 应填 TLSConfig")
+	// 无 TLS 时为 nil
+	assert.Nil(t, Config{RedisAddr: "h:6379"}.redisOpt().TLSConfig)
 }
 
 // TestPing_Integration 对真实 Redis 验证 server/client 的 Ping fail-fast 路径。

@@ -159,15 +159,19 @@ LIMIT @batch_size;
 
 -- name: ClaimConcurrencySlot :one
 -- R15 原子占位（提交前，与 task 落库同事务）：每 (account, model) 计数行 +1，
--- 仅当 inflight < @cap_limit。首次用 ON CONFLICT lazy upsert（新行 inflight=1，前提 cap>=1）。
+-- 仅当 inflight < @cap_limit。首次用 ON CONFLICT lazy upsert。
 -- 返回新 inflight；**返 0 行（pgx.ErrNoRows）= 占不到 = 调用方返 429**。
--- 用条件 UPDATE ... RETURNING（单语句原子，PG 行锁串行化），杜绝 count-then-act 的幻读 TOCTOU。
-INSERT INTO account_model_concurrency (business_account_id, model, inflight, updated_at)
-VALUES (@business_account_id, @model, 1, NOW())
+-- 用条件 UPSERT（单语句原子，PG 行锁串行化），杜绝 count-then-act 的幻读 TOCTOU。
+-- **cap=0 守卫**：INSERT...SELECT 的 `WHERE @cap_limit >= 1` 让首次插入路径也受 cap 约束——
+--   否则「行不存在 + cap=0」会绕过 ON CONFLICT 的 WHERE（仅作用于 DO UPDATE 分支）
+--   直接插入 inflight=1，使「禁用模型(cap=0)」失效（评审 #1）。
+INSERT INTO account_model_concurrency AS amc (business_account_id, model, inflight, updated_at)
+SELECT @business_account_id, @model, 1, NOW()
+WHERE @cap_limit::int >= 1
 ON CONFLICT (business_account_id, model) DO UPDATE
-    SET inflight   = account_model_concurrency.inflight + 1,
+    SET inflight   = amc.inflight + 1,
         updated_at = NOW()
-    WHERE account_model_concurrency.inflight < @cap_limit
+    WHERE amc.inflight < @cap_limit
 RETURNING inflight;
 
 

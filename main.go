@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
 
@@ -68,6 +69,10 @@ const (
 	dbPingTimeout = 5 * time.Second
 	// shutdownTimeout HTTP graceful shutdown 总预算。
 	shutdownTimeout = 30 * time.Second
+	// redisPingTimeout 启动期 Asynq/Redis ping 的超时（评审 #3；与 dbPingTimeout 同风格）。
+	redisPingTimeout = 5 * time.Second
+	// asynqShutdownTimeout Asynq 优雅停机外层上界（< shutdownTimeout，留 HTTP 停机余量；评审 #3）。
+	asynqShutdownTimeout = 20 * time.Second
 	// upstreamHTTPTimeout relay 调上游 chat completions 的客户端总超时（plan §决策 D2）。
 	// 同步非流式场景 60s 足够；超时 → ErrUpstreamTimeout → Release reserve + 504。
 	upstreamHTTPTimeout = 60 * time.Second
@@ -221,19 +226,30 @@ func run() error {
 	var asyncSrv *asyncq.Server
 	if cfg.AsyncEnabled {
 		asyncSrv = asyncq.NewServer(asyncq.Config{
-			RedisAddr:   cfg.RedisAddr,
-			Concurrency: cfg.AsyncConcurrency,
-			Logger:      logger,
+			RedisAddr:       cfg.RedisAddr,
+			RedisPassword:   cfg.RedisPassword,
+			RedisTLSEnabled: cfg.RedisTLSEnabled,
+			Concurrency:     cfg.AsyncConcurrency,
+			ShutdownTimeout: asynqShutdownTimeout,
+			Logger:          logger,
 		})
-		if err := asyncSrv.Ping(); err != nil {
-			return fmt.Errorf("Asynq/Redis 不可达（AsyncEnabled=true）: %w", err)
+		// Redis ping fail-fast，带超时（评审 #3：asynq Ping 自身无 deadline）。
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), redisPingTimeout)
+		pingErr := asyncSrv.PingContext(pingCtx)
+		pingCancel()
+		if pingErr != nil {
+			return fmt.Errorf("Asynq/Redis 不可达（AsyncEnabled=true）: %w", pingErr)
 		}
-		if err := asyncSrv.Start(asyncq.NewServeMux()); err != nil {
+		// 当前 mux 为空，handler 在 Unit 6/8 注册（届时 worker 装配 channel.Service +
+		// crypto.Keyring：crypto.DecodeKEK(cfg.GatewayKEKV1) → crypto.NewKeyring → channel.NewPostgresService）。
+		if err := asyncSrv.Start(asynq.NewServeMux()); err != nil {
+			asyncSrv.Shutdown() // 评审 #7：Start 失败也要停已起的内部 goroutine
 			return fmt.Errorf("启动 Asynq server 失败: %w", err)
 		}
 		logger.Info("Asynq 异步基座已启动",
 			slog.String("redis_addr", cfg.RedisAddr),
 			slog.Int("concurrency", cfg.AsyncConcurrency),
+			slog.Bool("redis_tls", cfg.RedisTLSEnabled),
 		)
 	} else {
 		logger.Info("AsyncEnabled=false：异步基座未启用，不连接 Redis")
@@ -273,7 +289,10 @@ func run() error {
 			logger.Error("HTTP server 异常退出，触发 cleanup",
 				slog.String("err", err.Error()))
 			if asyncSrv != nil {
-				asyncSrv.Shutdown()
+				if ok := asyncSrv.ShutdownWithTimeout(asynqShutdownTimeout); !ok {
+					logger.Error("Asynq server 停机超时（异常退出路径），强制继续",
+						slog.Duration("timeout", asynqShutdownTimeout))
+				}
 			}
 			reconCtrl.Stop()
 			return fmt.Errorf("HTTP server 异常退出: %w", err)
@@ -296,7 +315,10 @@ func run() error {
 
 	if asyncSrv != nil {
 		logger.Info("停止 Asynq server（等在途任务完成）")
-		asyncSrv.Shutdown()
+		if ok := asyncSrv.ShutdownWithTimeout(asynqShutdownTimeout); !ok {
+			logger.Error("Asynq server 停机超时，强制继续 cleanup",
+				slog.Duration("timeout", asynqShutdownTimeout))
+		}
 	}
 
 	reconCtrl.Stop()

@@ -331,7 +331,7 @@
 - `chk_task_submit_recover_count_non_negative` CHECK (submit_recover_count >= 0)
 - `chk_task_accounting_month_format` CHECK (accounting_month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$')
 
-**索引**（4 个，全部针对 P0 已知热路径）：
+**索引**（8 个；0001 建 4 + 0008 补 4 个异步 reconciler/回调热路径）：
 - `idx_task_inflight` (business_account_id, status) **WHERE status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED', 'SETTLED', 'SETTLE_FAILED')` —— inflight 查询（部分索引；0007 把 SETTLE_FAILED 纳入终态排除）
 - `idx_task_submit_recover` (status, submit_locked_until) **WHERE status = 'UPSTREAM_SUBMITTING'** —— 崩溃恢复 cron 扫描
 - `idx_task_accounting_month` (accounting_month, status) —— 月结查询

@@ -111,16 +111,26 @@ func (kr *Keyring) Decrypt(ciphertext []byte, keyVersion int32) ([]byte, error) 
 
 // DecodeKEK 把 KEK 字符串（hex 或 base64）解码为原始字节，并校验恰为 32 字节（AES-256）。
 //
-// 与 config 的 pepper 解码同思路：hex 优先（openssl rand -hex 32 → 64 字符），
-// 再尝试 base64 多形态（std / raw / urlsafe）。供 main.go 装配 keyring 时调用。
+// **按长度路由消歧义**（评审 #8）：32 字节 KEK 的 hex 形式恰为 64 字符、base64 形式为
+// 43/44 字符，两者长度不重叠。故 len==64 走 hex，否则走 base64——避免「base64 串恰好全是
+// hex 字符」被误当 hex 解码后长度校验失败、误导运维。供 main.go 装配 keyring 时调用。
 func DecodeKEK(encoded string) ([]byte, error) {
 	raw := strings.TrimSpace(encoded)
 	if raw == "" {
 		return nil, errors.New("crypto: KEK 为空")
 	}
-	b, err := decodeHexOrBase64(raw)
-	if err != nil {
-		return nil, err
+	var b []byte
+	var err error
+	if len(raw) == KEKBytes*2 { // 64 字符 → 必为 hex 形式的 32 字节
+		b, err = hex.DecodeString(raw)
+		if err != nil {
+			return nil, fmt.Errorf("crypto: KEK 长 64 字符但非合法 hex: %w", err)
+		}
+	} else { // 其余长度按 base64 解
+		b, err = decodeBase64Any(raw)
+		if err != nil {
+			return nil, errors.New("crypto: KEK 既非 64 字符 hex 也非合法 base64（应为 openssl rand -hex 32 或 -base64 32 输出）")
+		}
 	}
 	if len(b) != KEKBytes {
 		return nil, fmt.Errorf(
@@ -131,10 +141,27 @@ func DecodeKEK(encoded string) ([]byte, error) {
 	return b, nil
 }
 
-func decodeHexOrBase64(raw string) ([]byte, error) {
+// DecodeHexOrBase64 把 hex 或 base64 字符串解码为原始字节，不校验长度（长度由调用方判定）。
+//
+// hex 优先（openssl rand -hex 输出），再尝试 base64 多形态（std / raw / urlsafe）。
+// 供 config 的 pepper 解码复用（评审 #11：消除与本函数的重复实现）。
+// 注意：对长度敏感、需消歧义的固定长密钥（如 KEK）应改用 DecodeKEK 的按长度路由。
+func DecodeHexOrBase64(encoded string) ([]byte, error) {
+	raw := strings.TrimSpace(encoded)
+	if raw == "" {
+		return nil, errors.New("crypto: 输入为空")
+	}
 	if b, err := hex.DecodeString(raw); err == nil {
 		return b, nil
 	}
+	if b, err := decodeBase64Any(raw); err == nil {
+		return b, nil
+	}
+	return nil, errors.New("crypto: 既非合法 hex 也非合法 base64")
+}
+
+// decodeBase64Any 依次尝试 std / raw-std / urlsafe / raw-urlsafe 四种 base64 形态。
+func decodeBase64Any(raw string) ([]byte, error) {
 	if b, err := base64.StdEncoding.DecodeString(raw); err == nil {
 		return b, nil
 	}
@@ -147,5 +174,5 @@ func decodeHexOrBase64(raw string) ([]byte, error) {
 	if b, err := base64.RawURLEncoding.DecodeString(raw); err == nil {
 		return b, nil
 	}
-	return nil, errors.New("crypto: KEK 既非合法 hex 也非合法 base64")
+	return nil, errors.New("crypto: 非合法 base64")
 }

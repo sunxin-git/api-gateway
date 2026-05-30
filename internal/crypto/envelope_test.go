@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -182,9 +184,73 @@ func TestDecodeKEK(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// 确保 sentinel 可被 errors.Is 链式匹配（decryptCreds 等会 wrap）。
+// 确保 sentinel 经 %w 包装后仍可被 errors.Is 解开（channel.decryptCreds 等会 wrap，评审 #12）。
 func TestSentinelsWrappable(t *testing.T) {
-	wrapped := errors.New("ctx")
-	_ = wrapped
-	assert.True(t, errors.Is(ErrDecryptFailed, ErrDecryptFailed))
+	wrapped := fmt.Errorf("outer 上下文: %w", ErrDecryptFailed)
+	assert.True(t, errors.Is(wrapped, ErrDecryptFailed), "%w 包装后应能被 errors.Is 解开")
+	assert.False(t, errors.Is(wrapped, ErrUnknownKeyVersion), "不应误匹配其他 sentinel")
+}
+
+// TestDecodeKEK_Base64Variants 覆盖 4 种 base64 形态（评审 #13：原仅测 std）。
+func TestDecodeKEK_Base64Variants(t *testing.T) {
+	raw := make([]byte, KEKBytes)
+	_, err := rand.Read(raw)
+	require.NoError(t, err)
+	cases := map[string]string{
+		"std":    base64.StdEncoding.EncodeToString(raw),
+		"rawstd": base64.RawStdEncoding.EncodeToString(raw),
+		"url":    base64.URLEncoding.EncodeToString(raw),
+		"rawurl": base64.RawURLEncoding.EncodeToString(raw),
+	}
+	for name, enc := range cases {
+		t.Run(name, func(t *testing.T) {
+			require.NotEqual(t, KEKBytes*2, len(enc), "base64 形态长度不应等于 hex 的 64（否则走 hex 路由）")
+			b, err := DecodeKEK(enc)
+			require.NoError(t, err)
+			assert.Equal(t, raw, b)
+		})
+	}
+}
+
+// TestDecodeHexOrBase64 覆盖 config pepper 复用的导出函数（评审 #11）。
+func TestDecodeHexOrBase64(t *testing.T) {
+	raw := []byte("any-length-pepper-bytes-not-32")
+	b, err := DecodeHexOrBase64(hex.EncodeToString(raw))
+	require.NoError(t, err)
+	assert.Equal(t, raw, b)
+	b, err = DecodeHexOrBase64(base64.StdEncoding.EncodeToString(raw))
+	require.NoError(t, err)
+	assert.Equal(t, raw, b)
+	_, err = DecodeHexOrBase64("   ")
+	assert.Error(t, err)
+	_, err = DecodeHexOrBase64("@@@illegal@@@")
+	assert.Error(t, err)
+}
+
+// TestKeyringConcurrent 验证 Keyring 并发安全声明（评审：凭据加密涉并发，CLAUDE.md 要求并发测试）。
+// 须配合 `go test -race` 才能检出数据竞争。
+func TestKeyringConcurrent(t *testing.T) {
+	kr := mustKeyring(t, map[int32][]byte{1: mustKey(t), 2: mustKey(t)})
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			pt := []byte(fmt.Sprintf("secret-payload-%d", n))
+			ct, ver, err := kr.Encrypt(pt)
+			if err != nil {
+				t.Errorf("encrypt: %v", err)
+				return
+			}
+			got, err := kr.Decrypt(ct, ver)
+			if err != nil {
+				t.Errorf("decrypt: %v", err)
+				return
+			}
+			if !bytes.Equal(got, pt) {
+				t.Errorf("roundtrip 不一致")
+			}
+		}(i)
+	}
+	wg.Wait()
 }

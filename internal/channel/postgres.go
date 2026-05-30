@@ -122,6 +122,8 @@ func (s *PostgresService) GetByID(ctx context.Context, id int64) (*Channel, erro
 	return s.rowToChannelMasked(row), nil
 }
 
+// 评审 #10：List 系列**不逐行解密**（避免路由/列表热路径 O(N) AES-GCM）。
+// 返回元数据 + Credentials 占位「列表省略」；需掩码详情走 GetByID，取明文走 GetCredentialsForUpstream。
 func (s *PostgresService) ListActive(ctx context.Context) ([]*Channel, error) {
 	rows, err := s.queries.ListActiveChannels(ctx)
 	if err != nil {
@@ -129,7 +131,7 @@ func (s *PostgresService) ListActive(ctx context.Context) ([]*Channel, error) {
 	}
 	out := make([]*Channel, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, s.rowToChannelMasked(r))
+		out = append(out, rowToChannel(r, maskedListOmitted()))
 	}
 	return out, nil
 }
@@ -141,7 +143,7 @@ func (s *PostgresService) ListActiveByProvider(ctx context.Context, providerType
 	}
 	out := make([]*Channel, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, s.rowToChannelMasked(r))
+		out = append(out, rowToChannel(r, maskedListOmitted()))
 	}
 	return out, nil
 }

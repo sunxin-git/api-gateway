@@ -12,8 +12,6 @@
 package config
 
 import (
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -25,6 +23,8 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+
+	"github.com/sunxin-git/api-gateway/internal/crypto"
 )
 
 // 配置键常量（统一在此声明，避免散落各处 magic string）。
@@ -67,6 +67,9 @@ const (
 	// 同步 relay 部署零 Redis 依赖）；=true 时 main.go 对 Redis 做启动 ping fail-fast。
 	keyAsyncEnabled     = "gateway_async_enabled"
 	keyAsyncConcurrency = "gateway_async_concurrency"
+	// Redis 认证 / TLS（评审 #9：生产 Redis 须支持 ACL/mTLS）。
+	keyRedisPassword   = "gateway_redis_password"
+	keyRedisTLSEnabled = "gateway_redis_tls_enabled"
 )
 
 // asyncConcurrency 上下界（仅 AsyncEnabled 时校验）。
@@ -96,8 +99,13 @@ type Config struct {
 	PGDSN string
 	// RedisAddr Redis 连接地址（host:port），默认 "localhost:6379"。
 	RedisAddr string
+	// RedisPassword Redis ACL 密码（评审 #9）；空 = 无密码。json:"-" 防序列化泄露。
+	RedisPassword string `json:"-"`
+	// RedisTLSEnabled 是否对 Redis 启用 TLS（评审 #9）。
+	RedisTLSEnabled bool
 	// GatewayKEKV1 信封加密主密钥 v1（base64 或 hex 编码原始字节，由调用方解码），**必填**。
-	GatewayKEKV1 string
+	// json:"-" 防 Config 被意外 json 序列化 / 反射打日志时泄露密钥（评审 #19）。
+	GatewayKEKV1 string `json:"-"`
 	// AdminTokenSigningKey Admin Token 签名密钥，**必填**。
 	AdminTokenSigningKey string
 	// OTelExporter OTel trace exporter 类型，枚举 "stdout" | "otlp"，默认 "stdout"。
@@ -137,8 +145,8 @@ type Config struct {
 
 	// TokenPepper Admin Token HMAC pepper（决策 D1）；输入字符串为 base64 或 hex 编码 ≥ 32 字节。
 	// 解码后的原始字节存于 TokenPepperBytes；fail-fast 在所有环境下校验长度 ≥ 32。
-	TokenPepper      string
-	TokenPepperBytes []byte
+	TokenPepper      string `json:"-"` // 防序列化泄露（评审 #19）
+	TokenPepperBytes []byte `json:"-"`
 
 	// AdminAuditTier1Path Tier1（refund / token lifecycle / 401 / idempotency_conflict）
 	// 同步审计日志文件路径。production 强制有值；dev 可空（dev 不写 Tier1 文件）。
@@ -157,8 +165,8 @@ type Config struct {
 	RelayUpstreamProviderType string
 	// RelayUpstreamBaseURL 上游 base url（不含 /chat/completions）；production 强制 https。
 	RelayUpstreamBaseURL string
-	// RelayUpstreamAPIKey 上游凭据（MVP env 明文；P1 envelope encryption）。
-	RelayUpstreamAPIKey string
+	// RelayUpstreamAPIKey 上游凭据（MVP env 明文；P1 envelope encryption）。json:"-" 防泄露（评审 #19）。
+	RelayUpstreamAPIKey string `json:"-"`
 	// RelayUpstreamModelName 上游真实 model 名（如 "doubao-1-5-pro-32k-250115"）。
 	RelayUpstreamModelName string
 	// RelayPriceInputPer1MMinor / RelayPriceOutputPer1MMinor input/output token 单价（每 1M token，minor / CNY 分）。
@@ -202,6 +210,7 @@ func Load(envFilePath string) (*Config, error) {
 		keyRelayUpstreamProviderType: "openai_compat",
 		keyAsyncEnabled:              "false", // 默认不启用异步基座 → 零 Redis 依赖
 		keyAsyncConcurrency:          10,
+		keyRedisTLSEnabled:           "false",
 	}
 	if err := k.Load(mapProvider(defaults), nil); err != nil {
 		return nil, fmt.Errorf("加载默认值失败: %w", err)
@@ -276,6 +285,8 @@ func Load(envFilePath string) (*Config, error) {
 
 		AsyncEnabled:     k.Bool(keyAsyncEnabled),
 		AsyncConcurrency: int(k.Int64(keyAsyncConcurrency)),
+		RedisPassword:    k.String(keyRedisPassword),
+		RedisTLSEnabled:  k.Bool(keyRedisTLSEnabled),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -345,6 +356,10 @@ func (c *Config) validate() error {
 	// ===== Phase 2 异步基座校验（仅 AsyncEnabled 时） =====
 	// Redis 可达性不在此校验：由 main.go 启动期 ping fail-fast（与 pgxpool 同风格）。
 	if c.AsyncEnabled {
+		// 评审 #6：启用异步基座时 RedisAddr 必须非空（否则空值静默回落默认/误连）。
+		if strings.TrimSpace(c.RedisAddr) == "" {
+			return errors.New("GATEWAY_ASYNC_ENABLED=true 时 REDIS_ADDR 不能为空")
+		}
 		if c.AsyncConcurrency < minAsyncConcurrency || c.AsyncConcurrency > maxAsyncConcurrency {
 			return fmt.Errorf(
 				"GATEWAY_ASYNC_CONCURRENCY 非法值 %d，启用异步基座时须在 [%d, %d] 区间",
@@ -456,31 +471,10 @@ func (c *Config) validateTLS() error {
 
 // decodePepper 把 base64 或 hex 编码字符串解码为原始字节。
 //
-// 优先尝试 hex（OpenSSL `rand -hex 32` 输出），失败再尝试 base64。
-// 两种都失败返合并错误。
+// 复用 crypto.DecodeHexOrBase64（评审 #11：消除与 crypto 包的重复实现）。
+// pepper 长度可变（≥32 由调用方校验），故用不消歧义的 hex-优先解码，而非 KEK 的按长度路由。
 func decodePepper(s string) ([]byte, error) {
-	raw := strings.TrimSpace(s)
-	if raw == "" {
-		return nil, errors.New("empty")
-	}
-	// hex 先：长度偶数且全 [0-9a-fA-F]；典型 32 字节 → 64 hex 字符
-	if b, err := hex.DecodeString(raw); err == nil {
-		return b, nil
-	}
-	// base64：try std then raw urlsafe（含 padding 的 std 最常见）
-	if b, err := base64.StdEncoding.DecodeString(raw); err == nil {
-		return b, nil
-	}
-	if b, err := base64.RawStdEncoding.DecodeString(raw); err == nil {
-		return b, nil
-	}
-	if b, err := base64.URLEncoding.DecodeString(raw); err == nil {
-		return b, nil
-	}
-	if b, err := base64.RawURLEncoding.DecodeString(raw); err == nil {
-		return b, nil
-	}
-	return nil, errors.New("既非合法 hex 也非合法 base64")
+	return crypto.DecodeHexOrBase64(s)
 }
 
 // parseOrigins 把逗号分隔的字符串拆为切片，去除空项与首尾空白。

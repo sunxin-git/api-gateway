@@ -17,9 +17,12 @@ type Querier interface {
 	// 4. account_model_concurrency（R15 并发硬上限：原子 claim / release）
 	// ============================================================================
 	// R15 原子占位（提交前，与 task 落库同事务）：每 (account, model) 计数行 +1，
-	// 仅当 inflight < @cap_limit。首次用 ON CONFLICT lazy upsert（新行 inflight=1，前提 cap>=1）。
+	// 仅当 inflight < @cap_limit。首次用 ON CONFLICT lazy upsert。
 	// 返回新 inflight；**返 0 行（pgx.ErrNoRows）= 占不到 = 调用方返 429**。
-	// 用条件 UPDATE ... RETURNING（单语句原子，PG 行锁串行化），杜绝 count-then-act 的幻读 TOCTOU。
+	// 用条件 UPSERT（单语句原子，PG 行锁串行化），杜绝 count-then-act 的幻读 TOCTOU。
+	// **cap=0 守卫**：INSERT...SELECT 的 `WHERE @cap_limit >= 1` 让首次插入路径也受 cap 约束——
+	//   否则「行不存在 + cap=0」会绕过 ON CONFLICT 的 WHERE（仅作用于 DO UPDATE 分支）
+	//   直接插入 inflight=1，使「禁用模型(cap=0)」失效（评审 #1）。
 	ClaimConcurrencySlot(ctx context.Context, arg ClaimConcurrencySlotParams) (int32, error)
 	// 结算（无残余，actualCost == reserveAmount）：只 INSERT commit + UPDATE balance。
 	// 与 CommitWithReleaseAtomic 同语义，但少一条 release entry，sqlc 类型推导更干净。

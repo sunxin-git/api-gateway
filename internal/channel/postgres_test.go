@@ -126,7 +126,12 @@ func TestCreate_GetByID_Masked(t *testing.T) {
 	assertNoSecretLeak(t, created.Credentials)
 	assert.Equal(t, maskSet, created.Credentials.ARKSecretKey, "密钥类应固定占位")
 	assert.Equal(t, maskSet, created.Credentials.TOSSecretKey)
+	assert.Equal(t, "AKLTar***", created.Credentials.ARKAccessKey, "AK 前缀掩码")
+	assert.Equal(t, "AKLTto***", created.Credentials.TOSAccessKey, "AK 前缀掩码")
 	assert.Equal(t, "biz-001-videos", created.Credentials.TOSBucket, "非机密标识符原样")
+	assert.Equal(t, "tos-cn-beijing.volces.com", created.Credentials.TOSEndpoint, "非机密原样")
+	assert.Equal(t, "cn-beijing", created.Credentials.TOSRegion, "非机密原样")
+	assert.Equal(t, "proj-abc-123", created.Credentials.ProjectID, "非机密原样")
 	assert.Equal(t, "ark-12***", created.Credentials.APIKey, "APIKey 仅前缀")
 	assert.Equal(t, int32(1), created.KeyVersion)
 
@@ -237,6 +242,9 @@ func TestListActiveAndByProvider(t *testing.T) {
 	require.Len(t, byProv, 1, "唯一 provider_type 应只命中本测试渠道")
 	assert.Equal(t, ch.ID, byProv[0].ID)
 	assertNoSecretLeak(t, byProv[0].Credentials)
+	// 评审 #10：列表不解密，凭据字段为「列表省略」占位（详情走 GetByID）。
+	assert.Equal(t, maskListOmit, byProv[0].Credentials.ARKSecretKey, "列表视图不应解密凭据")
+	assert.Equal(t, maskListOmit, byProv[0].Credentials.TOSBucket)
 
 	all, err := svc.ListActive(context.Background())
 	require.NoError(t, err)
@@ -284,4 +292,60 @@ func TestSetEnabled_NotFound(t *testing.T) {
 	svc := NewPostgresService(pool, mustKeyring(t), silentLogger())
 	err := svc.SetEnabled(context.Background(), -99999, false)
 	assert.ErrorIs(t, err, ErrChannelNotFound)
+}
+
+func TestCreate_EmptyParams(t *testing.T) {
+	pool := mustPool(t)
+	svc := NewPostgresService(pool, mustKeyring(t), silentLogger())
+	_, err := svc.Create(context.Background(), CreateParams{Name: "", ProviderType: "x", Credentials: fullCreds()})
+	assert.ErrorIs(t, err, ErrInvalidParam, "空 name 应拒")
+	_, err = svc.Create(context.Background(), CreateParams{Name: "x", ProviderType: "  ", Credentials: fullCreds()})
+	assert.ErrorIs(t, err, ErrInvalidParam, "空白 provider_type 应拒")
+}
+
+func TestUpdateCredentials_NotFound(t *testing.T) {
+	pool := mustPool(t)
+	svc := NewPostgresService(pool, mustKeyring(t), silentLogger())
+	_, err := svc.UpdateCredentials(context.Background(), -99999, fullCreds())
+	assert.ErrorIs(t, err, ErrChannelNotFound)
+}
+
+// TestDecryptFail_CorruptJSON：GCM 解密通过但内容非 JSON → 仍 fail-closed（评审 testing gap）。
+func TestDecryptFail_CorruptJSON(t *testing.T) {
+	pool := mustPool(t)
+	kr := mustKeyring(t)
+	svc := NewPostgresService(pool, kr, silentLogger())
+	ch := createChannel(t, svc, pool, CreateParams{
+		Name:         uniqueName("test-chan-corrupt"),
+		ProviderType: uniqueName("test-prov"),
+		Enabled:      true,
+		Credentials:  fullCreds(),
+	})
+	// 用同一 keyring 加密「非 JSON」字节，直接覆盖密文 → GCM 会通过、json.Unmarshal 失败。
+	ct, _, err := kr.Encrypt([]byte("this-is-valid-gcm-but-not-json"))
+	require.NoError(t, err)
+	_, err = pool.Exec(context.Background(),
+		"UPDATE channel SET credentials_encrypted = $1 WHERE id = $2", ct, ch.ID)
+	require.NoError(t, err)
+
+	_, err = svc.GetCredentialsForUpstream(context.Background(), ch.ID)
+	assert.ErrorIs(t, err, ErrDecryptFailed, "GCM 通过但 JSON 损坏也须 fail-closed，不返明文")
+
+	view, err := svc.GetByID(context.Background(), ch.ID)
+	require.NoError(t, err)
+	assert.Equal(t, maskDecFailed, view.Credentials.ARKSecretKey, "损坏行掩码视图降级")
+}
+
+// TestMaskHelpers：纯函数，验证掩码/前缀逻辑（含 #14 rune 安全）。
+func TestMaskHelpers(t *testing.T) {
+	assert.Equal(t, maskUnset, maskSecret(""))
+	assert.Equal(t, maskUnset, maskSecret("   "))
+	assert.Equal(t, maskSet, maskSecret("secret"))
+
+	assert.Equal(t, maskUnset, maskPrefix(""))
+	assert.Equal(t, maskSet, maskPrefix("short"), "5≤6 视同机密")
+	assert.Equal(t, maskSet, maskPrefix("sixchr"), "6≤6 视同机密")
+	assert.Equal(t, "sevenc***", maskPrefix("sevench"), "7 字符保留前 6")
+	// rune 安全：多字节标识符按字符切，不切出非法 UTF-8（评审 #14）
+	assert.Equal(t, "中文项目标识***", maskPrefix("中文项目标识符ID"))
 }
