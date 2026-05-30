@@ -188,7 +188,7 @@ origin: docs/brainstorms/2026-05-31-gateway-admin-console-config-requirements.md
 
 **Verification:** `make sqlc` 通过 + diff guard 干净；`make migrate-up/down/up` 往返成功；schema.md 同步（含补登 0008–0011）。
 
-- [ ] **Unit 3: operator service（口令哈希 + 认证 + 初始管理员种子）**
+- [x] **Unit 3: operator service（口令哈希 + 认证 + 初始管理员种子）**
 
 **Goal:** 实现运维账户域服务：bcrypt 哈希、认证、create/disable/list、初始管理员 env 种子幂等。
 

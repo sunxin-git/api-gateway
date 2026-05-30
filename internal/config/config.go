@@ -49,6 +49,10 @@ const (
 	keyTokenPepper         = "gateway_token_pepper"
 	keyAdminAuditTier1Path = "admin_audit_high_value_log_path"
 
+	// 管理后台配置线 Unit 3 新增（ADR-0008：初始管理员 env 种子，仅表空时生效）。
+	keyAdminBootstrapUsername = "gateway_admin_bootstrap_username"
+	keyAdminBootstrapPassword = "gateway_admin_bootstrap_password"
+
 	// F-min Unit 7 新增（relay 业务路由 /v1 配置）。
 	// RelayEnabled=false（默认）时 /v1 路由不注册（admin-only 部署）；
 	// =true 时 8 个 RELAY_* 字段经 relay.NewEnvCatalog fail-fast 校验（main.go 装配时）。
@@ -196,6 +200,11 @@ type Config struct {
 	// AdminAuditTier1Path Tier1（refund / token lifecycle / 401 / idempotency_conflict）
 	// 同步审计日志文件路径。production 强制有值；dev 可空（dev 不写 Tier1 文件）。
 	AdminAuditTier1Path string
+
+	// AdminBootstrapUsername / AdminBootstrapPassword 管理后台初始管理员种子（ADR-0008 决策 6）。
+	// 仅 operator_account 表空时生效（幂等）；production 表空且二者均空 → 启动 fail-fast（见 operator.Bootstrap）。
+	AdminBootstrapUsername string `json:"-"` // 防序列化泄露（认证路径一半，与口令同惯例）
+	AdminBootstrapPassword string `json:"-"` // 防序列化泄露
 
 	// ===== F-min Unit 7 新增（relay 业务路由 /v1 配置） =====
 
@@ -371,23 +380,25 @@ func Load(envFilePath string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		HTTPAddr:             k.String(keyHTTPAddr),
-		LogLevel:             k.String(keyLogLevel),
-		PGDSN:                k.String(keyPGDSN),
-		RedisAddr:            k.String(keyRedisAddr),
-		GatewayKEKV1:         k.String(keyGatewayKEKV1),
-		AdminTokenSigningKey: k.String(keyAdminTokenSigningKey),
-		OTelExporter:         k.String(keyOTelExporter),
-		CORSAllowedOrigins:   parseOrigins(k.String(keyCORSAllowedOrigins)),
-		LedgerDriftAction:    k.String(keyLedgerDriftAction),
-		GatewayEnv:           normalizeEnv(k.String(keyGatewayEnv)),
-		TrustedProxyCIDRs:    parseOrigins(k.String(keyTrustedProxyCIDRs)),
-		ListenTLS:            k.Bool(keyListenTLS),
-		FrontTLSAck:          k.Bool(keyFrontTLSAck),
-		TLSCertPath:          k.String(keyTLSCertPath),
-		TLSKeyPath:           k.String(keyTLSKeyPath),
-		TokenPepper:          k.String(keyTokenPepper),
-		AdminAuditTier1Path:  k.String(keyAdminAuditTier1Path),
+		HTTPAddr:               k.String(keyHTTPAddr),
+		LogLevel:               k.String(keyLogLevel),
+		PGDSN:                  k.String(keyPGDSN),
+		RedisAddr:              k.String(keyRedisAddr),
+		GatewayKEKV1:           k.String(keyGatewayKEKV1),
+		AdminTokenSigningKey:   k.String(keyAdminTokenSigningKey),
+		OTelExporter:           k.String(keyOTelExporter),
+		CORSAllowedOrigins:     parseOrigins(k.String(keyCORSAllowedOrigins)),
+		LedgerDriftAction:      k.String(keyLedgerDriftAction),
+		GatewayEnv:             normalizeEnv(k.String(keyGatewayEnv)),
+		TrustedProxyCIDRs:      parseOrigins(k.String(keyTrustedProxyCIDRs)),
+		ListenTLS:              k.Bool(keyListenTLS),
+		FrontTLSAck:            k.Bool(keyFrontTLSAck),
+		TLSCertPath:            k.String(keyTLSCertPath),
+		TLSKeyPath:             k.String(keyTLSKeyPath),
+		TokenPepper:            k.String(keyTokenPepper),
+		AdminAuditTier1Path:    k.String(keyAdminAuditTier1Path),
+		AdminBootstrapUsername: k.String(keyAdminBootstrapUsername),
+		AdminBootstrapPassword: k.String(keyAdminBootstrapPassword),
 
 		RelayEnabled:               k.Bool(keyRelayEnabled),
 		RelayModelName:             k.String(keyRelayModelName),
