@@ -203,7 +203,11 @@ func run() error {
 	// 第 7bis 步：装配 + 注册业务 relay 路由组 /v1（仅 RelayEnabled=true 时）。
 	// admin-only 部署（RelayEnabled=false）跳过：不构造 businesskey / catalog / adapter，
 	// /v1 不存在（业务请求 404）。fail-fast：catalog 校验失败拒启动。
-	if cfg.RelayEnabled {
+	// 业务 /v1 路由组：同步 chat relay 和/或 异步视频中继任一启用即装配。
+	// 业务中间件链（HSTS→BodyLimit→KeyAuth→RPM→Audit）只建一次；chat 与 video 路由共用。
+	// video 路由在第 7ter 步注册（需 taskSvc，VideoRelayEnabled⟹AsyncEnabled），故此处保留 group 引用。
+	var bizV1 *gin.RouterGroup
+	if cfg.RelayEnabled || cfg.VideoRelayEnabled {
 		bizKeySvc := businesskey.NewPostgresService(pool, cfg.TokenPepperBytes, logger)
 		defer func() { _ = bizKeySvc.Close() }()
 
@@ -212,18 +216,22 @@ func run() error {
 		})
 		defer func() { _ = bizRPM.Close() }()
 
-		relayHandler, err := buildRelayHandler(cfg, ledgerSvc, metrics, logger)
-		if err != nil {
-			return fmt.Errorf("装配 relay handler 失败: %w", err)
+		bizV1 = newBusinessV1Group(srv, bizKeySvc, bizRPM, auditLogger, metrics)
+
+		if cfg.RelayEnabled {
+			relayHandler, err := buildRelayHandler(cfg, ledgerSvc, metrics, logger)
+			if err != nil {
+				return fmt.Errorf("装配 relay handler 失败: %w", err)
+			}
+			bizV1.POST("/chat/completions", relayHandler.ChatCompletion)
+			logger.Info("业务同步 relay 路由已注册",
+				slog.String("path", "/v1/chat/completions"),
+				slog.String("gateway_model", cfg.RelayModelName),
+				slog.String("upstream_provider", cfg.RelayUpstreamProviderType),
+			)
 		}
-		registerBusinessRoutes(srv, relayHandler, bizKeySvc, bizRPM, auditLogger, metrics)
-		logger.Info("业务 relay 路由已注册",
-			slog.String("path", "/v1/chat/completions"),
-			slog.String("gateway_model", cfg.RelayModelName),
-			slog.String("upstream_provider", cfg.RelayUpstreamProviderType),
-		)
 	} else {
-		logger.Info("RelayEnabled=false：admin-only 部署，/v1 业务路由未注册")
+		logger.Info("RelayEnabled=false 且 VideoRelayEnabled=false：admin-only 部署，/v1 业务路由未注册")
 	}
 
 	// 第 7ter 步：异步执行基座（Asynq + Redis；ADR-0006 / Unit 1）。仅 AsyncEnabled 时装配。
@@ -255,13 +263,28 @@ func run() error {
 		// 周期 sweep scheduler。VideoRelayEnabled ⟹ AsyncEnabled（config.validate 已保证），故在此嵌套。
 		mux := asynq.NewServeMux()
 		if cfg.VideoRelayEnabled {
-			taskSvc, enq, err := buildVideoTaskService(cfg, pool, ledgerSvc, logger)
+			taskSvc, videoCatalog, enq, err := buildVideoTaskService(cfg, pool, ledgerSvc, logger)
 			if err != nil {
 				asyncSrv.Shutdown()
 				return fmt.Errorf("装配视频异步任务 service 失败: %w", err)
 			}
 			videoEnqueuer = enq
 			taskSvc.RegisterHandlers(mux)
+
+			// 业务对外视频 API 路由（Unit 10）：挂在已建业务 /v1 组下（bizV1 由 RelayEnabled||VideoRelayEnabled
+			// 装配；VideoRelayEnabled⟹此处非 nil）。提交/查询/查余额共用业务中间件链。
+			if bizV1 != nil {
+				vh := httpapi.NewVideoHandler(taskSvc, videoCatalog,
+					cfg.VideoRelaySafetyFactorBP, cfg.VideoRelayMinTokenFloor,
+					time.Duration(cfg.VideoResultURLTTLSeconds)*time.Second, logger)
+				registerVideoBusinessRoutes(bizV1, vh)
+				logger.Info("业务视频中继路由已注册",
+					slog.String("submit", "/v1/video/generations"),
+					slog.String("query", "/v1/video/generations/:id"),
+					slog.String("balance", "/v1/account/balance"),
+					slog.String("gateway_model", cfg.VideoRelayModelName),
+				)
+			}
 
 			// 回调入口（Unit 8）：仅配置了回调 base URL 时注册公网回调路由（鉴权 = URL 路径 per-task
 			// token，不走业务 key 链）。未配 → 纯轮询兜底（submit 不带回调 URL，sweep 主动 Poll）。
@@ -615,22 +638,21 @@ func buildRelayHandler(cfg *config.Config, l ledger.Service, m *obs.Metrics, log
 	return relay.NewRelayHandler(catalog, adapter, l, handlerMetrics, log), nil
 }
 
-// registerBusinessRoutes 把业务 relay endpoint 挂在 /v1 路由组下，装好业务中间件链。
+// newBusinessV1Group 创建业务 /v1 路由组并装好业务中间件链（chat / video 路由共用此组）。
 //
 // 链顺序（plan §Unit 4 业务链）：
 //
 //	HSTS → BusinessBodyLimit(1MiB) → BusinessKeyAuth → BusinessRPM → BusinessAudit → handler
 //
 // 与 admin 链对称：BodyLimit 在鉴权前（pre-auth 拒绝超大 body）；Audit 在 handler 前最后一环
-// （defer 模式保证一定 emit）。
-func registerBusinessRoutes(
+// （defer 模式保证一定 emit）。返回组引用，调用方按需注册具体 endpoint。
+func newBusinessV1Group(
 	srv *httpapi.Server,
-	h *relay.RelayHandler,
 	keySvc businesskey.Service,
 	rpm *businesskey.InProcessRPM,
 	auditLogger audit.AuditLogger,
 	m *obs.Metrics,
-) {
+) *gin.RouterGroup {
 	g := srv.Engine().Group("/v1")
 	g.Use(
 		middleware.HSTS(),
@@ -639,7 +661,14 @@ func registerBusinessRoutes(
 		middleware.BusinessRPM(rpm, m.BusinessAPIRateLimitedTotal),
 		middleware.BusinessAudit(auditLogger, m.AdminAuditWriteFailedTotal),
 	)
-	g.POST("/chat/completions", h.ChatCompletion)
+	return g
+}
+
+// registerVideoBusinessRoutes 把业务对外视频 API endpoint 挂在已建业务 /v1 组下（Unit 10）。
+func registerVideoBusinessRoutes(g *gin.RouterGroup, h *httpapi.VideoHandler) {
+	g.POST("/video/generations", h.Submit)
+	g.GET("/video/generations/:id", h.Get)
+	g.GET("/account/balance", h.GetBalance)
 }
 
 // =============================================================================
@@ -698,10 +727,10 @@ func buildVideoTaskService(
 	pool *pgxpool.Pool,
 	ledgerSvc ledger.Service,
 	log *slog.Logger,
-) (*task.Service, *task.AsynqEnqueuer, error) {
+) (*task.Service, video.VideoCatalog, *task.AsynqEnqueuer, error) {
 	keyring, err := buildKeyring(cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("装配凭据 keyring: %w", err)
+		return nil, nil, nil, fmt.Errorf("装配凭据 keyring: %w", err)
 	}
 	channelSvc := channel.NewPostgresService(pool, keyring, log)
 
@@ -726,7 +755,7 @@ func buildVideoTaskService(
 		ResolutionDefault:      cfg.VideoRelayResolutionDefault,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("装配 video catalog: %w", err)
+		return nil, nil, nil, fmt.Errorf("装配 video catalog: %w", err)
 	}
 
 	// 上游 HTTP 客户端：总超时兜底（单次 Submit/Poll 由 ctx deadline 控制，见 task.Service 超时配置）。
@@ -750,7 +779,7 @@ func buildVideoTaskService(
 	limits, err := video.NewConcurrencyLimits(int32(cfg.VideoRelayConcurrencyDefault), nil)
 	if err != nil {
 		_ = enqueuer.Close()
-		return nil, nil, fmt.Errorf("装配并发上限解析器: %w", err)
+		return nil, nil, nil, fmt.Errorf("装配并发上限解析器: %w", err)
 	}
 
 	// Unit 9 结果转存：注入 TOS ObjectStore 工厂（per-channel 凭据即用即弃构造）+ 拉取产物的 HTTP 客户端。
@@ -769,6 +798,7 @@ func buildVideoTaskService(
 		Adapter:            adapter,
 		Catalog:            catalog,
 		Creds:              channelSvc,
+		Channels:           channelSvc, // Unit 10：按 catalog 绑定名解析 channel_id（提交流程）
 		Enqueuer:           enqueuer,
 		Logger:             log,
 		WorkerID:           hostnameOrUnknown(),
@@ -780,9 +810,9 @@ func buildVideoTaskService(
 	})
 	if err != nil {
 		_ = enqueuer.Close()
-		return nil, nil, fmt.Errorf("构造 task.Service: %w", err)
+		return nil, nil, nil, fmt.Errorf("构造 task.Service: %w", err)
 	}
-	return svc, enqueuer, nil
+	return svc, catalog, enqueuer, nil
 }
 
 // buildKeyring 从 cfg.GatewayKEKV1 装配单版本 KEK keyring（ADR-0006 决策 4；P1 扩多版本 V2…）。

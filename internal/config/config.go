@@ -99,6 +99,11 @@ const (
 	// Phase 2 Unit 8：回调入口 + 账户×模型并发默认上限。
 	keyVideoCallbackBaseURL         = "gateway_video_callback_base_url"
 	keyVideoRelayConcurrencyDefault = "gateway_video_relay_concurrency_default"
+
+	// Unit 10：reserve 估算安全系数 / 最低 token 下限（Unit 7 残留单一配置源）+ 结果签名 URL TTL。
+	keyVideoRelaySafetyFactorBP = "gateway_video_relay_safety_factor_bp"
+	keyVideoRelayMinTokenFloor  = "gateway_video_relay_min_token_floor"
+	keyVideoResultURLTTLSeconds = "gateway_video_result_url_ttl_seconds"
 )
 
 // asyncConcurrency 上下界（仅 AsyncEnabled 时校验）。
@@ -109,6 +114,14 @@ const (
 
 // maxVideoConcurrencyDefault 账户×模型并发默认上限的上界（防误配天文数字；Unit 8）。
 const maxVideoConcurrencyDefault = 1000
+
+// Unit 10 视频计费/结果 URL 校验边界。
+const (
+	// minVideoSafetyFactorBP 安全系数下界（10000=1.0×）：低于此 reserve 会 under-reserve。
+	minVideoSafetyFactorBP = 10_000
+	// maxResultURLTTLSeconds 结果签名 URL TTL 上界（= TOS 预签名上限 7 天）。
+	maxResultURLTTLSeconds = 604_800
+)
 
 // 环境模式常量。
 const (
@@ -262,6 +275,14 @@ type Config struct {
 	// VideoRelayConcurrencyDefault 账户×模型并发默认上限（R15；DB 原子 claim 的 cap）。默认 5；
 	// per-(account,model) 覆写预留给 Unit 11 admin。Unit 8。
 	VideoRelayConcurrencyDefault int
+
+	// VideoRelaySafetyFactorBP reserve 估算安全系数基点（10000=1.0×，默认 12000=1.2×；Unit 7 残留单一配置源）。
+	// 须 ≥ 10000，否则 reserve 可能 under-reserve（撞账本 ErrCommitExceedsReserved）。
+	VideoRelaySafetyFactorBP int64
+	// VideoRelayMinTokenFloor 最低 token 计费下限（seedance 2.0，ADR-0006；默认 0=无下限，落地核对官方）。
+	VideoRelayMinTokenFloor int64
+	// VideoResultURLTTLSeconds 结果签名 URL TTL（秒；默认 900=15min，最小化为业务取回所需，非整个轮询窗口）。
+	VideoResultURLTTLSeconds int64
 }
 
 // Load 加载并校验配置。
@@ -301,7 +322,10 @@ func Load(envFilePath string) (*Config, error) {
 		keyVideoRelayRatios:                 "16:9,9:16,1:1,adaptive",
 		keyVideoRelayRatioDefault:           "16:9",
 		keyVideoRelayResolutionDefault:      "720p",
-		keyVideoRelayConcurrencyDefault:     5, // 账户×模型并发默认上限（Unit 8）
+		keyVideoRelayConcurrencyDefault:     5,     // 账户×模型并发默认上限（Unit 8）
+		keyVideoRelaySafetyFactorBP:         12000, // 1.2×（reserve 安全系数，Unit 7/10）
+		keyVideoRelayMinTokenFloor:          0,     // 默认无最低 token 下限（落地核对 seedance 官方）
+		keyVideoResultURLTTLSeconds:         900,   // 15min 结果签名 URL TTL（Unit 10）
 		// keyVideoCallbackBaseURL 无默认（空 = 纯轮询兜底，不注册回调路由）
 	}
 	if err := k.Load(mapProvider(defaults), nil); err != nil {
@@ -401,6 +425,9 @@ func Load(envFilePath string) (*Config, error) {
 		VideoRelayResolutionDefault:      k.String(keyVideoRelayResolutionDefault),
 		VideoCallbackBaseURL:             strings.TrimSpace(k.String(keyVideoCallbackBaseURL)),
 		VideoRelayConcurrencyDefault:     int(k.Int64(keyVideoRelayConcurrencyDefault)),
+		VideoRelaySafetyFactorBP:         k.Int64(keyVideoRelaySafetyFactorBP),
+		VideoRelayMinTokenFloor:          k.Int64(keyVideoRelayMinTokenFloor),
+		VideoResultURLTTLSeconds:         k.Int64(keyVideoResultURLTTLSeconds),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -495,6 +522,17 @@ func (c *Config) validate() error {
 
 	// Unit 8：并发默认上限 + 回调 base URL 校验（仅 VideoRelayEnabled 时）。
 	if c.VideoRelayEnabled {
+		if c.VideoRelaySafetyFactorBP < minVideoSafetyFactorBP {
+			return fmt.Errorf("%s=%d 不能小于 %d（安全系数须 ≥ 1.0×，否则 reserve 可能 under-reserve）",
+				keyVideoRelaySafetyFactorBP, c.VideoRelaySafetyFactorBP, minVideoSafetyFactorBP)
+		}
+		if c.VideoRelayMinTokenFloor < 0 {
+			return fmt.Errorf("%s=%d 不能为负", keyVideoRelayMinTokenFloor, c.VideoRelayMinTokenFloor)
+		}
+		if c.VideoResultURLTTLSeconds < 1 || c.VideoResultURLTTLSeconds > maxResultURLTTLSeconds {
+			return fmt.Errorf("%s=%d 秒越界（须 1..%d）",
+				keyVideoResultURLTTLSeconds, c.VideoResultURLTTLSeconds, maxResultURLTTLSeconds)
+		}
 		if c.VideoRelayConcurrencyDefault < 1 || c.VideoRelayConcurrencyDefault > maxVideoConcurrencyDefault {
 			return fmt.Errorf(
 				"GATEWAY_VIDEO_RELAY_CONCURRENCY_DEFAULT 非法值 %d，须在 [1, %d]（账户×模型并发默认上限）",

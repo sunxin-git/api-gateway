@@ -89,6 +89,9 @@ type Querier interface {
 	// 已 frozen 返回 0 行；service 判幂等成功（不视为错误）。
 	// 不写 ledger entry（frozen 是 balance 字段，不涉及金额流水）；调用方自行写 outbox。
 	FreezeAtomic(ctx context.Context, arg FreezeAtomicParams) (BusinessAccountBalance, error)
+	// 按渠道名解析启用渠道的 id（Unit 10 提交流程：catalog 绑定的 channel 名 → channel_id）。
+	// name 唯一；不命中 / 已停用返 0 rows → 调用方 ErrChannelNotFound（fail-closed，模型不可用）。
+	GetActiveChannelIDByName(ctx context.Context, name string) (int64, error)
 	// balance.sql —— 账户余额投影读取
 	//
 	// 写路径由 ledger.sql 的 CTE 单语句完成（INSERT ledger + UPDATE balance）；

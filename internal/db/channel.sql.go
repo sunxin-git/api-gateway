@@ -24,6 +24,19 @@ func (q *Queries) DeleteChannel(ctx context.Context, id int64) (int64, error) {
 	return result.RowsAffected(), nil
 }
 
+const getActiveChannelIDByName = `-- name: GetActiveChannelIDByName :one
+SELECT id FROM channel WHERE name = $1 AND enabled = true
+`
+
+// 按渠道名解析启用渠道的 id（Unit 10 提交流程：catalog 绑定的 channel 名 → channel_id）。
+// name 唯一；不命中 / 已停用返 0 rows → 调用方 ErrChannelNotFound（fail-closed，模型不可用）。
+func (q *Queries) GetActiveChannelIDByName(ctx context.Context, name string) (int64, error) {
+	row := q.db.QueryRow(ctx, getActiveChannelIDByName, name)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getChannelByID = `-- name: GetChannelByID :one
 SELECT id, name, provider_type, enabled, restricted_business_accounts, channel_purpose, credentials_encrypted, key_version, other_settings, created_at, updated_at FROM channel WHERE id = $1
 `

@@ -171,6 +171,18 @@ func (s *PostgresService) Delete(ctx context.Context, id int64) (bool, error) {
 	return n > 0, nil
 }
 
+// ResolveActiveChannelID 按渠道名解析启用渠道的 id（提交流程用；不命中/停用 → ErrChannelNotFound）。
+func (s *PostgresService) ResolveActiveChannelID(ctx context.Context, name string) (int64, error) {
+	id, err := s.queries.GetActiveChannelIDByName(ctx, name)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrChannelNotFound
+		}
+		return 0, fmt.Errorf("GetActiveChannelIDByName 失败: %w", err)
+	}
+	return id, nil
+}
+
 // =============================================================================
 // GetCredentialsForUpstream（唯一返明文；解密失败 fail-closed）
 // =============================================================================

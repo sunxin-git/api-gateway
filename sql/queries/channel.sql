@@ -65,3 +65,9 @@ RETURNING id, enabled;
 -- name: DeleteChannel :execrows
 -- 硬删除渠道（运营慎用；返回受影响行数判断是否存在）。
 DELETE FROM channel WHERE id = @id;
+
+
+-- name: GetActiveChannelIDByName :one
+-- 按渠道名解析启用渠道的 id（Unit 10 提交流程：catalog 绑定的 channel 名 → channel_id）。
+-- name 唯一；不命中 / 已停用返 0 rows → 调用方 ErrChannelNotFound（fail-closed，模型不可用）。
+SELECT id FROM channel WHERE name = @name AND enabled = true;

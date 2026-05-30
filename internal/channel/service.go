@@ -57,6 +57,10 @@ type Service interface {
 	// GetByID 按 id 查渠道（掩码视图）。错误：ErrChannelNotFound。
 	GetByID(ctx context.Context, id int64) (*Channel, error)
 
+	// ResolveActiveChannelID 按渠道名解析启用渠道的 id（Unit 10 提交流程：catalog 绑定名 → channel_id）。
+	// 不存在 / 已停用 → ErrChannelNotFound（fail-closed）。
+	ResolveActiveChannelID(ctx context.Context, name string) (int64, error)
+
 	// ListActive 列出所有启用渠道（掩码视图）。
 	ListActive(ctx context.Context) ([]*Channel, error)
 

@@ -435,7 +435,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 **Verification:** mock TOS 全路径测试通过；签名 URL 受限且不入日志。
 
-- [ ] **Unit 10: 业务对外 API（提交/查询）+ 跨租户隔离 + entitlement**
+- [x] **Unit 10: 业务对外 API（提交/查询）+ 跨租户隔离 + entitlement**（internal/httpapi/video_handler.go: POST /v1/video/generations（bind→entitlement 403→能力校验 400→EstimateReserveMinor→Submit，前置失败 reserve 前短路）+ GET /v1/video/generations/:id（强制归属，跨租户 404 不可枚举）+ GET /v1/account/balance；OpenAI 兼容错误映射复用 relay.WriteErrorJSON（402/403/404/429/503）；succeeded 时按 oss_object_meta 现签结果 URL（不入日志）。internal/task/read.go: TaskView/ErrTaskNotFound/GetForAccount（SQL 强制 business_account_id 归属）/GetBalance/CheckEntitlement/PresignResult。channel 加 GetActiveChannelIDByName + ResolveActiveChannelID；task.Service 加 ChannelResolver，Submit 内 pre-reserve 按 catalog 绑定名解析 channel_id（失败短路无 orphan reserve）。Unit 7 残留落地：safety/floor/result_url_ttl 接「单一配置源」（GATEWAY_VIDEO_RELAY_SAFETY_FACTOR_BP=12000 / MIN_TOKEN_FLOOR=0 / RESULT_URL_TTL_SECONDS=900 + fail-fast 校验）。main.go 业务 /v1 组重构为 RelayEnabled||VideoRelayEnabled 共用中间件链。测试先行覆盖跨租户越权（A 查 B 的 task→404，读层真 PG + handler fake 双层）+ entitlement 403 + 校验 400 + 402/429/503 + balance + apiStatus 映射矩阵。已 build/vet/全量 go test ./... -count=1 -p 1 全绿；待 ce-review + 推送。**残留（按计划/ADR 延后）**：MinTokenFloor/safety 真实 usage 校准仍待 Unit 5 实测；errors.go 错误映射置于 handler 层（video 包不引 gin，关注点分离），未单建 internal/relay/video/errors.go。）
 
 **Goal:** 暴露 `POST /v1/video/generations`（提交 text_to_video）+ `GET /v1/video/generations/{id}`（轮询本地状态）+ 查余额/用量；强制跨租户归属（404）+ entitlement 校验（403）。
 

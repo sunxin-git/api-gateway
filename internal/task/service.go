@@ -34,6 +34,13 @@ type CredentialResolver interface {
 	GetCredentialsForUpstream(ctx context.Context, id int64) (*channel.ChannelCredentials, error)
 }
 
+// ChannelResolver 按渠道名解析 channel_id（提交流程把 catalog 绑定名 → channel_id；channel.Service 满足）。
+//
+// nil → Submit 不自动解析，依赖 caller 显式传 SubmitParams.ChannelID（6a 测试路径）。
+type ChannelResolver interface {
+	ResolveActiveChannelID(ctx context.Context, name string) (int64, error)
+}
+
 // Service 异步视频任务服务：提交流程 + 状态机 CAS 封装 + settle 编排（plan §Unit 6）。
 //
 // 持久依赖经构造注入（DIP）；不持隐式全局 state。所有状态变更走带 from 条件的 CAS。
@@ -44,6 +51,7 @@ type Service struct {
 	adapter  video.AsyncProviderAdapter
 	catalog  video.VideoCatalog
 	creds    CredentialResolver
+	channels ChannelResolver
 	enqueuer Enqueuer
 	logger   *slog.Logger
 
@@ -100,6 +108,7 @@ type Config struct {
 	Adapter  video.AsyncProviderAdapter
 	Catalog  video.VideoCatalog
 	Creds    CredentialResolver
+	Channels ChannelResolver
 	Enqueuer Enqueuer
 	Logger   *slog.Logger
 
@@ -178,6 +187,7 @@ func NewService(cfg Config) (*Service, error) {
 		adapter:                cfg.Adapter,
 		catalog:                cfg.Catalog,
 		creds:                  cfg.Creds,
+		channels:               cfg.Channels,
 		enqueuer:               cfg.Enqueuer,
 		logger:                 cfg.Logger,
 		cap:                    cfg.ConcurrencyCap,
@@ -287,6 +297,16 @@ func (s *Service) Submit(ctx context.Context, p SubmitParams) (string, error) {
 	tier, ok := p.Entry.Pricing.Tier(p.Request.Resolution)
 	if !ok {
 		return "", fmt.Errorf("task.Submit: 分辨率 %q 无定价（catalog 不一致）", p.Request.Resolution)
+	}
+
+	// 解析 channel（catalog 绑定名 → channel_id）：pre-reserve 短路（解析失败时无 orphan reserve）。
+	// caller 已显式传 ChannelID（6a 测试）则尊重；否则按 Entry.ChannelName 解析（生产 handler 路径）。
+	if p.ChannelID == nil && s.channels != nil && p.Entry.ChannelName != "" {
+		chID, err := s.channels.ResolveActiveChannelID(ctx, p.Entry.ChannelName)
+		if err != nil {
+			return "", fmt.Errorf("task.Submit 解析 channel %q: %w", p.Entry.ChannelName, err)
+		}
+		p.ChannelID = &chID
 	}
 
 	taskID := newTaskID()
