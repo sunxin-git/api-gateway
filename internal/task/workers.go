@@ -179,8 +179,10 @@ func (s *Service) handleSubmit(ctx context.Context, taskID string) error {
 		return s.failSubmit(ctx, t, "credential_error", err)
 	}
 
-	// 调上游 Submit（6a 纯轮询：callbackURL 空；Unit 8 注入带 token 回调 URL）
-	upstreamTaskID, err := s.adapter.Submit(ctx, entry, creds, snap.ToValidatedRequest(), "")
+	// 调上游 Submit（Unit 8：注入含 per-task token 的回调 URL；base 未配 → 空串 = 纯轮询兜底）。
+	// 含 token 的 callbackURL 绝不入日志（不在任何 slog 字段出现）。
+	callbackURL := s.buildCallbackURL(t.ID, t.CallbackToken)
+	upstreamTaskID, err := s.adapter.Submit(ctx, entry, creds, snap.ToValidatedRequest(), callbackURL)
 	if err != nil {
 		return s.handleSubmitError(ctx, t, err)
 	}

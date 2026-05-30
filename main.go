@@ -260,6 +260,14 @@ func run() error {
 			videoEnqueuer = enq
 			taskSvc.RegisterHandlers(mux)
 
+			// 回调入口（Unit 8）：仅配置了回调 base URL 时注册公网回调路由（鉴权 = URL 路径 per-task
+			// token，不走业务 key 链）。未配 → 纯轮询兜底（submit 不带回调 URL，sweep 主动 Poll）。
+			if cfg.VideoCallbackBaseURL != "" {
+				registerVideoCallbackRoutes(srv, taskSvc, logger)
+				logger.Info("视频回调入口已注册",
+					slog.String("route", task.CallbackPathPrefix+"/:task_id/:token"))
+			}
+
 			videoScheduler = asyncq.NewScheduler(asyncq.Config{
 				RedisAddr:       cfg.RedisAddr,
 				RedisPassword:   cfg.RedisPassword,
@@ -735,16 +743,25 @@ func buildVideoTaskService(
 		RedisTLSEnabled: cfg.RedisTLSEnabled,
 	}))
 
+	// R15 并发上限值解析器（Unit 8）：默认值来自 config；per-(account,model) 覆写预留 Unit 11 admin。
+	limits, err := video.NewConcurrencyLimits(int32(cfg.VideoRelayConcurrencyDefault), nil)
+	if err != nil {
+		_ = enqueuer.Close()
+		return nil, nil, fmt.Errorf("装配并发上限解析器: %w", err)
+	}
+
 	svc, err := task.NewService(task.Config{
-		Pool:     pool,
-		Ledger:   ledgerSvc,
-		Adapter:  adapter,
-		Catalog:  catalog,
-		Creds:    channelSvc,
-		Enqueuer: enqueuer,
-		Logger:   log,
-		WorkerID: hostnameOrUnknown(),
-		// ConcurrencyCap + 各超时 / sweep 阈值用 task 包默认（Unit 8 接入 per-account×model 覆写）。
+		Pool:            pool,
+		Ledger:          ledgerSvc,
+		Adapter:         adapter,
+		Catalog:         catalog,
+		Creds:           channelSvc,
+		Enqueuer:        enqueuer,
+		Logger:          log,
+		WorkerID:        hostnameOrUnknown(),
+		Limits:          limits,                   // Unit 8：账户×模型并发上限（DB 原子 claim 的 cap）
+		CallbackBaseURL: cfg.VideoCallbackBaseURL, // Unit 8：空 → 纯轮询兜底
+		// 各超时 / sweep 阈值用 task 包默认。
 	})
 	if err != nil {
 		_ = enqueuer.Close()
@@ -779,4 +796,27 @@ func registerVideoSweepSchedule(sched *asyncq.Scheduler) error {
 		}
 	}
 	return nil
+}
+
+// 回调端点全局限速参数（Unit 8；defense-in-depth，主防线是 per-task token 校验 + 去抖）。
+const (
+	callbackThrottleRPS   = 50  // 稳态每秒令牌；远超正常上游回调速率
+	callbackThrottleBurst = 100 // 突发桶容量
+)
+
+// registerVideoCallbackRoutes 注册上游回调入口（Unit 8）：
+//
+//	POST {task.CallbackPathPrefix}/:task_id/:token
+//
+// 中间件链：CallbackThrottle（全局限速）→ CallbackBodyLimit（64 KiB）→ handler。
+// **不**走业务 key 鉴权链（上游调用；鉴权 = URL 路径 per-task token，在 svc.HandleCallback 内常量时间校验）。
+func registerVideoCallbackRoutes(srv *httpapi.Server, svc *task.Service, logger *slog.Logger) {
+	h := httpapi.NewVideoCallbackHandler(svc, logger)
+	throttle := middleware.NewCallbackThrottle(callbackThrottleRPS, callbackThrottleBurst)
+	g := srv.Engine().Group(task.CallbackPathPrefix)
+	g.Use(
+		throttle.Middleware(),
+		middleware.CallbackBodyLimit(),
+	)
+	g.POST("/:task_id/:token", h.Handle)
 }

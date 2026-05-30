@@ -368,7 +368,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 **Verification:** 计费矩阵测试全绿；reserve 可证 ≥ settle；缺 usage / 超额兜底路径覆盖。
 
-- [ ] **Unit 8: 回调 ingress + 安全 + 账户×模型并发**
+- [x] **Unit 8: 回调 ingress + 安全 + 账户×模型并发**（callback_handler.go + callback_token.go(per-task token 生成/常量时间校验/HandleCallback 去抖) + concurrency.go(并发上限值解析，接入 service claim) + middleware/callback.go(全局令牌桶限速 + body 上限，零新依赖) + config/main 装配；回调体不可信(Poll 反查)、终态置空 token、token 仅路径段不入日志；复用 6a/6b 的 markUpstreamTerminal CAS 推终态 + 赢家唯一入队 settle。已 ce-review(并发/重放/跨任务 token/时钟回拨/cap=0 禁用测试齐备；adversarial double-release P0 经 PG 行锁串行化证伪 + 并发回调测试钉死)+推送。**残留(延后)**：限速 per-replica(MVP 单副本)、并发覆写热加载/DB 化(Unit 11)、上游回调超时预算实测校准(Unit 5)）
 
 **Goal:** 实现回调接收端点（per-task token 校验、回调体不可信、防重放、限速）+ 账户×模型并发硬上限（**DB 原子 claim 权威**，非 Asynq 队列 concurrency）。
 

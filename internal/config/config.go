@@ -95,6 +95,10 @@ const (
 	keyVideoRelayRatios                 = "gateway_video_relay_ratios"
 	keyVideoRelayRatioDefault           = "gateway_video_relay_ratio_default"
 	keyVideoRelayResolutionDefault      = "gateway_video_relay_resolution_default"
+
+	// Phase 2 Unit 8：回调入口 + 账户×模型并发默认上限。
+	keyVideoCallbackBaseURL         = "gateway_video_callback_base_url"
+	keyVideoRelayConcurrencyDefault = "gateway_video_relay_concurrency_default"
 )
 
 // asyncConcurrency 上下界（仅 AsyncEnabled 时校验）。
@@ -102,6 +106,9 @@ const (
 	minAsyncConcurrency = 1
 	maxAsyncConcurrency = 1000
 )
+
+// maxVideoConcurrencyDefault 账户×模型并发默认上限的上界（防误配天文数字；Unit 8）。
+const maxVideoConcurrencyDefault = 1000
 
 // 环境模式常量。
 const (
@@ -247,6 +254,14 @@ type Config struct {
 	VideoRelayRatios                 []string // aspect ratio 枚举（CSV 解析）
 	VideoRelayRatioDefault           string
 	VideoRelayResolutionDefault      string
+
+	// VideoCallbackBaseURL 回调入口 base URL（如 https://gw.example.com）；空 = 纯轮询兜底（不注册
+	// 回调路由、submit 不带回调 URL）。production 强制 https。submit worker 据此 + per-task token
+	// 构造交给上游的回调 URL（含 token 的 URL 绝不入日志）。Unit 8。
+	VideoCallbackBaseURL string
+	// VideoRelayConcurrencyDefault 账户×模型并发默认上限（R15；DB 原子 claim 的 cap）。默认 5；
+	// per-(account,model) 覆写预留给 Unit 11 admin。Unit 8。
+	VideoRelayConcurrencyDefault int
 }
 
 // Load 加载并校验配置。
@@ -286,6 +301,8 @@ func Load(envFilePath string) (*Config, error) {
 		keyVideoRelayRatios:                 "16:9,9:16,1:1,adaptive",
 		keyVideoRelayRatioDefault:           "16:9",
 		keyVideoRelayResolutionDefault:      "720p",
+		keyVideoRelayConcurrencyDefault:     5, // 账户×模型并发默认上限（Unit 8）
+		// keyVideoCallbackBaseURL 无默认（空 = 纯轮询兜底，不注册回调路由）
 	}
 	if err := k.Load(mapProvider(defaults), nil); err != nil {
 		return nil, fmt.Errorf("加载默认值失败: %w", err)
@@ -382,6 +399,8 @@ func Load(envFilePath string) (*Config, error) {
 		VideoRelayRatios:                 parseOrigins(k.String(keyVideoRelayRatios)),
 		VideoRelayRatioDefault:           k.String(keyVideoRelayRatioDefault),
 		VideoRelayResolutionDefault:      k.String(keyVideoRelayResolutionDefault),
+		VideoCallbackBaseURL:             strings.TrimSpace(k.String(keyVideoCallbackBaseURL)),
+		VideoRelayConcurrencyDefault:     int(k.Int64(keyVideoRelayConcurrencyDefault)),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -472,6 +491,31 @@ func (c *Config) validate() error {
 			"GATEWAY_VIDEO_RELAY_ENABLED=true 时必须同时设置 GATEWAY_ASYNC_ENABLED=true" +
 				"（视频中继依赖异步执行基座 Asynq+Redis）",
 		)
+	}
+
+	// Unit 8：并发默认上限 + 回调 base URL 校验（仅 VideoRelayEnabled 时）。
+	if c.VideoRelayEnabled {
+		if c.VideoRelayConcurrencyDefault < 1 || c.VideoRelayConcurrencyDefault > maxVideoConcurrencyDefault {
+			return fmt.Errorf(
+				"GATEWAY_VIDEO_RELAY_CONCURRENCY_DEFAULT 非法值 %d，须在 [1, %d]（账户×模型并发默认上限）",
+				c.VideoRelayConcurrencyDefault, maxVideoConcurrencyDefault,
+			)
+		}
+		if c.VideoCallbackBaseURL != "" {
+			https := strings.HasPrefix(c.VideoCallbackBaseURL, "https://")
+			if !https && !strings.HasPrefix(c.VideoCallbackBaseURL, "http://") {
+				return fmt.Errorf(
+					"GATEWAY_VIDEO_CALLBACK_BASE_URL 必须以 http:// 或 https:// 开头（当前 %q）",
+					c.VideoCallbackBaseURL,
+				)
+			}
+			if c.GatewayEnv == EnvProduction && !https {
+				return fmt.Errorf(
+					"production 模式 GATEWAY_VIDEO_CALLBACK_BASE_URL 必须 https（防回调 token 明文传输；当前 %q）",
+					c.VideoCallbackBaseURL,
+				)
+			}
+		}
 	}
 
 	return nil

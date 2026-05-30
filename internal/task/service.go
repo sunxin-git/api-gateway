@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -44,8 +45,14 @@ type Service struct {
 	enqueuer Enqueuer
 	logger   *slog.Logger
 
-	// cap R15 静态默认并发上限（Unit 8 接入 per-account×model 覆写）。
+	// cap R15 静态默认并发上限（limits==nil 时回退；6a 兼容）。
 	cap int32
+	// limits R15 并发上限值解析器（默认 + per-(account,model) 覆写，Unit 8）；nil 回退静态 cap。
+	//   实际并发硬上限由 DB 原子 claim 实施（ClaimConcurrencySlot 以本值为 cap），非 Asynq 队列。
+	limits *video.ConcurrencyLimits
+	// callbackBaseURL 回调入口 base URL（如 https://gw.example.com）；空 = 不注册回调、纯轮询兜底（6a）。
+	//   submit worker 据此 + per-task token 构造交给上游的回调 URL（含 token 的 URL 绝不入日志）。
+	callbackBaseURL string
 	// submitLeaseTTL submit worker 抢占 lease 时长（recover 据此判过期，6b）。
 	submitLeaseTTL time.Duration
 	// settleTO settle 的 ledger commit/release 独立 ctx 超时。
@@ -83,10 +90,14 @@ type Config struct {
 	Logger   *slog.Logger
 
 	ConcurrencyCap int32
-	SubmitLeaseTTL time.Duration
-	SettleTimeout  time.Duration
-	PollTimeout    time.Duration
-	WorkerID       string
+	// Limits R15 并发上限值解析器（默认 + 覆写，Unit 8）；nil → 回退静态 ConcurrencyCap。
+	Limits *video.ConcurrencyLimits
+	// CallbackBaseURL 回调入口 base URL；空 → 纯轮询兜底（不注册回调，6a）。
+	CallbackBaseURL string
+	SubmitLeaseTTL  time.Duration
+	SettleTimeout   time.Duration
+	PollTimeout     time.Duration
+	WorkerID        string
 
 	// 6b sweep 阈值/批量（零值回落默认；测试可注入小值）。
 	SubmittedNoJobAge   time.Duration
@@ -128,19 +139,21 @@ func NewService(cfg Config) (*Service, error) {
 		return nil, errors.New("task.NewService: Logger 不能为 nil")
 	}
 	s := &Service{
-		pool:           cfg.Pool,
-		q:              db.New(cfg.Pool),
-		ledger:         cfg.Ledger,
-		adapter:        cfg.Adapter,
-		catalog:        cfg.Catalog,
-		creds:          cfg.Creds,
-		enqueuer:       cfg.Enqueuer,
-		logger:         cfg.Logger,
-		cap:            cfg.ConcurrencyCap,
-		submitLeaseTTL: cfg.SubmitLeaseTTL,
-		settleTO:       cfg.SettleTimeout,
-		pollTO:         cfg.PollTimeout,
-		workerID:       cfg.WorkerID,
+		pool:            cfg.Pool,
+		q:               db.New(cfg.Pool),
+		ledger:          cfg.Ledger,
+		adapter:         cfg.Adapter,
+		catalog:         cfg.Catalog,
+		creds:           cfg.Creds,
+		enqueuer:        cfg.Enqueuer,
+		logger:          cfg.Logger,
+		cap:             cfg.ConcurrencyCap,
+		limits:          cfg.Limits,
+		callbackBaseURL: cfg.CallbackBaseURL,
+		submitLeaseTTL:  cfg.SubmitLeaseTTL,
+		settleTO:        cfg.SettleTimeout,
+		pollTO:          cfg.PollTimeout,
+		workerID:        cfg.WorkerID,
 
 		submittedNoJobAge:   cfg.SubmittedNoJobAge,
 		stuckUpstreamAge:    cfg.StuckUpstreamAge,
@@ -231,6 +244,11 @@ func (s *Service) Submit(ctx context.Context, p SubmitParams) (string, error) {
 
 	taskID := newTaskID()
 	correlation := taskID // 钉死 reserve↔commit/release 同 correlation（plan §Unit 7）
+	// 回调 token（Unit 8）：仅在配置了回调 base URL 时生成（纯轮询模式无需）；caller 显式传值则尊重
+	//（测试覆写）。token 是独立于 task_id 的秘密，只嵌入交给上游的回调 URL，业务方不可见。
+	if p.CallbackToken == "" && s.callbackBaseURL != "" {
+		p.CallbackToken = newCallbackToken()
+	}
 	snap := TaskFinancialSnapshot{
 		GatewayModel:               p.Entry.GatewayModelName,
 		UpstreamModel:              p.Entry.UpstreamModelName,
@@ -291,11 +309,16 @@ func (s *Service) claimAndInsert(ctx context.Context, p SubmitParams, taskID str
 
 	q := s.q.WithTx(tx)
 
-	// claim 占位：占不到（pgx.ErrNoRows）= 已达 cap = 429
+	// claim 占位：占不到（pgx.ErrNoRows）= 已达 cap = 429。
+	// cap 值由 limits 按 (account, model) 解析（覆写优先），nil 回退静态默认（6a 兼容）。
+	capLimit := s.cap
+	if s.limits != nil {
+		capLimit = s.limits.Cap(p.BusinessAccountID, p.Entry.GatewayModelName)
+	}
 	if _, err := q.ClaimConcurrencySlot(ctx, db.ClaimConcurrencySlotParams{
 		BusinessAccountID: p.BusinessAccountID,
 		Model:             p.Entry.GatewayModelName,
-		CapLimit:          s.cap,
+		CapLimit:          capLimit,
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrConcurrencyLimit
@@ -395,6 +418,21 @@ func (s *Service) resolveCreds(ctx context.Context, channelID pgtype.Int8) (vide
 // =============================================================================
 // helpers
 // =============================================================================
+
+// CallbackPathPrefix 回调 ingress 路由前缀（main.go 注册路由 + buildCallbackURL 构造 URL 同源，
+// 保持一致）。完整路由：POST {CallbackPathPrefix}/:task_id/:token——token 置于路径不可枚举段（非 query）。
+const CallbackPathPrefix = "/v1/callbacks/video"
+
+// buildCallbackURL 由 callbackBaseURL + per-task token 构造交给上游的回调 URL（submit worker 用）。
+//
+// base 未配 / token 缺失 → 返空串（纯轮询模式，不注册回调）。
+// **含 token 的完整 URL 绝不入日志/审计/span**（token 是回调鉴权秘密，ADR-0006 决策 5）。
+func (s *Service) buildCallbackURL(taskID string, token pgtype.Text) string {
+	if s.callbackBaseURL == "" || !token.Valid || token.String == "" {
+		return ""
+	}
+	return strings.TrimRight(s.callbackBaseURL, "/") + CallbackPathPrefix + "/" + taskID + "/" + token.String
+}
 
 // newTaskID 生成全局唯一 task_id（"vtask_" + 16 字节随机 hex）。
 func newTaskID() string {
