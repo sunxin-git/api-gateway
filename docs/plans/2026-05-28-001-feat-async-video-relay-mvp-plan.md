@@ -338,7 +338,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 **Verification:** 真 PG 下全状态机路径 + 并发 CAS + 重入幂等 + 崩溃恢复测试通过；无 orphan reserve。
 
-- [ ] **Unit 7: 计费（token 口径 reserve→settle）**
+- [x] **Unit 7: 计费（token 口径 reserve→settle）**（billing.go: `EstimateReserveMinor` reserve 权威公式 + `BilledMinorCeil` 单一换算真相源(溢出饱和 fail-closed)；settle 侧复用 6a 的 `snapshot.SettleMinor`，跨包 settle≤reserve 不变量测试钉死不漂移；已 ce-review + 推送。**残留(按计划/ADR 延后)**：安全系数 1.2× 与 adaptive 档 W×H 上界须 Unit 5 实测校准；`MinTokenFloor` 单一配置源由 Unit 10 接线，settle≤reserve 由账本 cap 兜底）
 
 **Goal:** 实现 reserve 估算（token 上界）与 settle 实算（真实 usage），价格走 catalog + 快照，保证 settle ≤ reserve。
 
