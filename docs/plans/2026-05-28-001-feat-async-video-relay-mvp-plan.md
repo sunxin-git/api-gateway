@@ -143,7 +143,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 ### Phase 0 — 异步基座与依赖
 
-- [ ] **Unit 1: ADR + Asynq/Redis 装配**
+- [x] **Unit 1: ADR + Asynq/Redis 装配**
 
 **Goal:** 开 ADR 确立异步执行基座（Asynq+Redis）+ TOS 接入方式选型；引入依赖；装配 Asynq client/server + Redis 连接 + 配置 fail-fast。
 
@@ -175,7 +175,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 ### Phase 1 — 数据层与凭据
 
-- [ ] **Unit 2: 0005 migration + channel/task/entitlement sqlc 查询**
+- [x] **Unit 2: 0005 migration + channel/task/entitlement sqlc 查询**
 
 **Goal:** 补 schema（task.callback_token、entitlement 表）+ 为 channel/task/entitlement 写全部 sqlc 查询，含 task 状态机 CAS。
 
@@ -205,7 +205,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 **Verification:** `make sqlc` 通过 + diff guard 干净；`make migrate-up`/`down`/`up` 往返成功；schema.md 同步。
 
-- [ ] **Unit 3: 凭据加解密（AES-GCM）+ Channel service**
+- [x] **Unit 3: 凭据加解密（AES-GCM）+ Channel service**
 
 **Goal:** 实现 KEK 派生的 AES-GCM 凭据加解密 + Channel 5 段凭据结构 + CRUD service，凭据明文绝不入日志、解密 fail-closed。
 
@@ -239,7 +239,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 ### Phase 2 — 模型适配
 
-- [ ] **Unit 4: video catalog + 能力描述符（校验级，env 单条）**
+- [x] **Unit 4: video catalog + 能力描述符（校验级，env 单条）**
 
 **Goal:** 为视频提供 env 单条 catalog（gateway-model → seedance channel 绑定 + pricing + 能力描述符），能力描述符驱动 text_to_video 请求校验。
 
@@ -270,7 +270,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 **Verification:** catalog 构造 fail-fast 矩阵 + 校验通过/拒绝矩阵测试全绿。
 
-- [ ] **Unit 5: seedance 异步 provider adapter**
+- [x] **Unit 5: seedance 异步 provider adapter**
 
 **Goal:** 实现 `AsyncProviderAdapter`（Submit/Poll），对接 seedance 视频 API（提交 + 查询），注册带 token 的回调 URL，映射上游状态到 task 状态。
 
@@ -303,7 +303,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 ### Phase 3 — 异步任务闭环
 
-- [ ] **Unit 6: 任务状态机 + 提交流程 + Asynq workers**
+- [x] **Unit 6: 任务状态机 + 提交流程 + Asynq workers**（6a 提交流程/FSM/settle + 6b 周期兜底/崩溃恢复 sweep，均已 ce-review + 推送）
 
 **Goal:** 实现 task service（提交流程 + 状态机 CAS）+ Asynq submit/fetch-reconciler/settle workers + 崩溃恢复 + 终态收敛；R15 并发硬上限由 **DB 原子 claim**（Unit 2 计数行）承载，Asynq 队列仅作执行隔离不作上限。
 
