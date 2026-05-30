@@ -1,7 +1,7 @@
 # Schema 总览（当前生效版本）
 
-> **当前 migration 版本**：0007
-> **migration 文件**：`0001_init` + `0002_ledger_fields_extension` + `0003_admin_token_usage_and_circuit` + `0004_business_account_api_key` + `0005_async_video_relay` + `0006_task_status_settle_failed` + `0007_task_inflight_index_exclude_settle_failed`（均含 `.{up,down}.sql`）
+> **当前 migration 版本**：0011
+> **migration 文件**：`0001_init` + `0002_ledger_fields_extension` + `0003_admin_token_usage_and_circuit` + `0004_business_account_api_key` + `0005_async_video_relay` + `0006_task_status_settle_failed` + `0007_task_inflight_index_exclude_settle_failed` + `0008_task_reconciler_indexes` + `0009_task_stuck_settling_index` + `0010_oss_object_meta` + `0011_admin_console_auth`（均含 `.{up,down}.sql`）
 > **PG 版本要求**：≥ 15（项目宪法 CLAUDE.md 技术栈）
 > **本文档命名约定**：不带版本号，永远描述「当前生效 schema」；每次 migration 后增量加章节
 >
@@ -21,6 +21,10 @@
 | 0005 | 2026-05-29 | 异步视频中继数据层：task 加 callback_token + upstream_submitted_at；新表 account_model_concurrency（R15 并发计数行）+ business_account_model_entitlement（账户×模型授权） | [异步视频中继 MVP plan](../plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md) |
 | 0006 | 2026-05-29 | task_status 枚举增 SETTLE_FAILED（第 10 态，结算失败终态）；独立文件（PG 不能在同事务使用新枚举值） | 同上 |
 | 0007 | 2026-05-29 | 重建 idx_task_inflight，终态排除谓词纳入 SETTLE_FAILED（须在 0006 ADD VALUE 之后的独立文件） | 同上 |
+| 0008 | 2026-05-30 | task 异步 reconciler / 回调热路径 4 个部分索引（idx_task_upstream_task_id / idx_task_stuck_upstream_submitted / idx_task_submitted_no_job / idx_task_expirable） | [异步视频中继 MVP plan](../plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md) |
+| 0009 | 2026-05-30 | idx_task_stuck_settling 部分索引（fetch reconciler 扫 SETTLING 超时） | 同上 |
+| 0010 | 2026-05-30 | 新表 oss_object_meta（成功任务 TOS 转存产物持久元数据；签名 URL 不入库）+ idx_task_settled_needing_store 部分索引 | 同上 |
+| 0011 | 2026-05-31 | 管理后台会话认证：新表 operator_account（运维登录账户，bcrypt 口令）+ admin_session（PG 会话，存 token HMAC + 每会话 csrf_token） | [管理后台配置线 plan](../plans/2026-05-31-001-feat-admin-console-config-plan.md) |
 
 ---
 
@@ -618,3 +622,97 @@ CREATE INDEX idx_task_inflight ON task (business_account_id, status)
 ```
 
 该索引仅供 reconciler 扫卡住任务 / metrics 聚合，**非** R15 cap 计数（cap 走 `account_model_concurrency` 原子 claim）。down 还原为 0001 的 5 终态排除谓词。
+
+---
+
+## 0008 演化（2026-05-30）
+
+> 计划：[异步视频中继 MVP plan](../plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md) Unit 2/6（ce-review 补索引）
+
+`task` 新增 4 个部分索引，覆盖回调反查与各 reconciler scan（避免任务表增长后全表扫描）：
+
+| 索引 | 谓词 | 用途 |
+|---|---|---|
+| `idx_task_upstream_task_id` | `WHERE upstream_task_id IS NOT NULL` | 回调入口 + fetch reconciler 按上游 task_id 反查 |
+| `idx_task_stuck_upstream_submitted` | `WHERE status='UPSTREAM_SUBMITTED'` | fetch reconciler 扫上游超时 |
+| `idx_task_submitted_no_job` | `WHERE status='SUBMITTED'` | reconciler 扫入队丢失滞留 |
+| `idx_task_expirable` | `WHERE status IN (SUBMITTED,UPSTREAM_SUBMITTING,UPSTREAM_SUBMITTED)` | expire worker 扫三态超最长执行期 |
+
+---
+
+## 0009 演化（2026-05-30）
+
+> 计划：同上 Unit 6b
+
+`task` 新增 1 个部分索引：
+
+| 索引 | 谓词 | 用途 |
+|---|---|---|
+| `idx_task_stuck_settling` | `WHERE status='SETTLING'`（按 updated_at） | fetch reconciler 扫硬崩溃于结算落账后、终态 CAS 前的卡住任务 |
+
+---
+
+## 0010 演化（2026-05-30）
+
+> 计划：[异步视频中继 MVP plan](../plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md) Unit 9；决策 [ADR-0006](../adr/0006-async-execution-asynq-redis.md) 决策 3
+
+### 新表：`oss_object_meta`（TOS 转存产物持久元数据）
+
+每个成功任务转存到企业 TOS 的产物对象的持久元数据；**签名 URL 读时现签不入库**，**不存上游源 URL**。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `task_id` | text NOT NULL | **PK** + FK → task(id) ON DELETE CASCADE；一任务一对象，天然幂等 |
+| `business_account_id` | text NOT NULL | denormalized 归属（便于按账户清理 / 归属查询） |
+| `bucket` / `object_key` / `region` / `endpoint` | text NOT NULL | 转存时绑定的 channel TOS 配置快照；`object_key` 含不可枚举随机段 + project_id 隔离前缀 |
+| `content_type` | text NOT NULL DEFAULT '' | 对象内容类型 |
+| `size_bytes` | bigint NOT NULL DEFAULT 0 | 对象大小（CHECK ≥ 0） |
+| `stored_at` | timestamptz NOT NULL DEFAULT NOW() | 转存时刻 |
+
+- **PK** `task_id`；**FK CASCADE** `task_id → task(id)`；**CHECK** `size_bytes >= 0`
+- 新增 `idx_task_settled_needing_store`（`WHERE status='SETTLED' AND error_code IS NULL`，按 updated_at）：支持 `ScanSettledNeedingStore` 的 recoverMissingStore sweep（既有 idx_task_inflight 排除 SETTLED，不可用）。
+
+---
+
+## 0011 演化（2026-05-31）
+
+> 计划：[管理后台配置线 plan](../plans/2026-05-31-001-feat-admin-console-config-plan.md) Unit 2；决策 [ADR-0008](../adr/0008-admin-console-session-auth.md)
+
+### 新表：`operator_account`（运维登录账户）
+
+管理后台会话认证；初始管理员经 env 种子，其余由初始管理员后台开通。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | bigserial NOT NULL | **PK** |
+| `username` | text NOT NULL | UNIQUE；登录用户名 |
+| `password_hash` | text NOT NULL | **bcrypt(口令)**；低熵口令慢哈希（区别于 admin_token/business_key 的 HMAC）；明文/哈希绝不回显 |
+| `enabled` | boolean NOT NULL DEFAULT true | 软禁用；false 拒绝登录 |
+| `created_by` | text NOT NULL | 种子为 `'seed'`，后台开通为 `'operator:<id>'` |
+| `created_at` / `updated_at` | timestamptz NOT NULL DEFAULT NOW() | |
+
+- **PK** `id`；**UNIQUE** `username`
+
+### 新表：`admin_session`（PG 会话）
+
+会话存 PG（非 Redis）；存 token 的 HMAC 而非明文（ADR-0008 决策 3）。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | bigserial NOT NULL | **PK** |
+| `session_token_hash` | text NOT NULL | UNIQUE；`HMAC(pepper, 会话明文 token)` hex；明文仅在 HttpOnly Cookie |
+| `operator_id` | bigint NOT NULL | FK → operator_account(id) ON DELETE CASCADE |
+| `csrf_token` | text NOT NULL | 每会话 CSRF token；会话通道状态变更请求须带；Bearer 通道豁免 |
+| `expires_at` | timestamptz NOT NULL | 鉴权校验 `expires_at > NOW()`；sweep 清过期 |
+| `created_at` | timestamptz NOT NULL DEFAULT NOW() | |
+| `last_seen_at` | timestamptz NULL | 最近活跃（best-effort） |
+
+- **PK** `id`；**UNIQUE** `session_token_hash`；**FK CASCADE** `operator_id → operator_account(id)`
+- **索引** `idx_admin_session_operator (operator_id)`：FK / 禁用账户批量清会话
+
+### sqlc 生成代码
+
+- `internal/db/operator_account.sql.go`：InsertOperatorAccount / GetOperatorAccountByUsername（含 password_hash，仅认证）/ GetOperatorAccountByID / ListOperatorAccounts / CountOperatorAccounts / SetOperatorAccountEnabled / UpdateOperatorPassword
+- `internal/db/admin_session.sql.go`：InsertAdminSession / GetActiveAdminSessionByTokenHash（JOIN operator 校验 enabled + 未过期）/ TouchAdminSessionLastSeen / DeleteAdminSessionByTokenHash / DeleteAdminSessionsByOperator / DeleteExpiredAdminSessions
+
+---

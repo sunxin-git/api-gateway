@@ -49,6 +49,8 @@ type Querier interface {
 	// 统计某 (account, model) 当前在途任务数（reconciler 对账 / metrics 用）。
 	// **非** R15 cap 计数——cap 由 account_model_concurrency 原子 claim 承载（ADR-0006 决策 2）。
 	CountInflightByAccountModel(ctx context.Context, arg CountInflightByAccountModelParams) (int64, error)
+	// 计数；初始管理员种子幂等判定（表空才种子）。
+	CountOperatorAccounts(ctx context.Context) (int64, error)
 	// business_account.sql —— 业务账户 CRUD
 	//
 	// 适用范围：账户创建（同事务建 balance 行）/ 读取 / 入口 active 校验。
@@ -61,8 +63,14 @@ type Querier interface {
 	CreateBusinessAccount(ctx context.Context, arg CreateBusinessAccountParams) (BusinessAccount, error)
 	// 创建账户的零值 balance 行（与 CreateBusinessAccount 同事务）。
 	CreateBusinessAccountBalanceZero(ctx context.Context, businessAccountID string) (BusinessAccountBalance, error)
+	// 登出：按 token_hash 删会话；返回受影响行数（0 = 会话已不存在，幂等）。
+	DeleteAdminSessionByTokenHash(ctx context.Context, sessionTokenHash string) (int64, error)
+	// 禁用账户 / 强制下线：删某运维全部会话。
+	DeleteAdminSessionsByOperator(ctx context.Context, operatorID int64) (int64, error)
 	// 硬删除渠道（运营慎用；返回受影响行数判断是否存在）。
 	DeleteChannel(ctx context.Context, id int64) (int64, error)
+	// sweep：清理已过期会话（后台定期调用）。
+	DeleteExpiredAdminSessions(ctx context.Context) (int64, error)
 	// 鉴权热路径：根据 token_hash 单 query 查活跃 token（未 revoke + 未过期）。
 	// service 层调用前先算 hex = hex.EncodeToString(HMAC-SHA-256(pepper, plaintext))。
 	FindActiveAdminTokenByHash(ctx context.Context, tokenHash string) (FindActiveAdminTokenByHashRow, error)
@@ -89,6 +97,9 @@ type Querier interface {
 	// 已 frozen 返回 0 行；service 判幂等成功（不视为错误）。
 	// 不写 ledger entry（frozen 是 balance 字段，不涉及金额流水）；调用方自行写 outbox。
 	FreezeAtomic(ctx context.Context, arg FreezeAtomicParams) (BusinessAccountBalance, error)
+	// 鉴权热路径：按 token_hash 取**未过期 + 账户启用**的会话，并带出运维身份。
+	// 任一不满足（无会话 / 已过期 / 账户禁用）→ 0 rows → 中间件 fail-closed 401。
+	GetActiveAdminSessionByTokenHash(ctx context.Context, sessionTokenHash string) (GetActiveAdminSessionByTokenHashRow, error)
 	// 按渠道名解析启用渠道的 id（Unit 10 提交流程：catalog 绑定的 channel 名 → channel_id）。
 	// name 唯一；不命中 / 已停用返 0 rows → 调用方 ErrChannelNotFound（fail-closed，模型不可用）。
 	GetActiveChannelIDByName(ctx context.Context, name string) (int64, error)
@@ -123,6 +134,11 @@ type Querier interface {
 	GetLedgerEntriesForRebuild(ctx context.Context, businessAccountID string) ([]GetLedgerEntriesForRebuildRow, error)
 	// 按 task_id 取产物元数据（store 幂等判存 + Unit 10 GET 现签 URL 用）。不命中返 0 rows。
 	GetOSSObjectMetaByTask(ctx context.Context, taskID string) (OssObjectMetum, error)
+	// 按 id 查账户（**不含 password_hash**；运维 / 会话归属校验用）。
+	GetOperatorAccountByID(ctx context.Context, id int64) (GetOperatorAccountByIDRow, error)
+	// 认证热路径：按用户名取账户（**含 password_hash**，仅认证用）。
+	// 调用方校验 enabled 再比对口令（禁用账户拒登）。
+	GetOperatorAccountByUsername(ctx context.Context, username string) (OperatorAccount, error)
 	// 内部按 id 查任务（worker / reconciler 用，不做归属过滤）。
 	GetTaskByID(ctx context.Context, id string) (Task, error)
 	// 按上游 task_id 反查本地任务（回调入口 / fetch reconciler 用）。
@@ -146,6 +162,16 @@ type Querier interface {
 	// 三列分别累加（recharge / refund / create）；调用方按场景传非零的那一列，其他传 0。
 	// day 用 UTC 当日（决策 D9）。
 	IncrementTokenUsage(ctx context.Context, arg IncrementTokenUsageParams) (GatewayAdminTokenUsage, error)
+	// admin_session.sql —— 管理后台 PG 会话 CRUD + 鉴权热路径
+	//
+	// 决策依据：ADR-0008（会话存 PG；存 token 的 HMAC 而非明文）
+	// 实施计划：docs/plans/2026-05-31-001-feat-admin-console-config-plan.md Unit 2（供 Unit 4 会话中间件）
+	//
+	// 安全约定：
+	//   - session_token_hash = HMAC(pepper, 会话明文 token) hex；明文只在 HttpOnly Cookie。
+	//   - 鉴权按 token_hash 单 row 查 + 校验 expires_at > NOW() + 账户 enabled。
+	// 登录成功建会话；session_token_hash / csrf_token / expires_at 由 service 层（Unit 4）算好传入。
+	InsertAdminSession(ctx context.Context, arg InsertAdminSessionParams) (InsertAdminSessionRow, error)
 	// admin_token.sql —— Admin Token CRUD + 阀门用量累计 + 熔断器状态机
 	//
 	// 设计文档：docs/multimedia-gateway-design.md §9bis.6（Admin Token 安全 5 件套）
@@ -204,6 +230,19 @@ type Querier interface {
 	// 记录转存产物元数据；ON CONFLICT DO NOTHING 实现幂等（重复 store / 并发重投命中 PK 冲突 → 0 行）。
 	// 返回受影响行数：1 = 本次插入，0 = 已存在（幂等跳过）。
 	InsertOSSObjectMeta(ctx context.Context, arg InsertOSSObjectMetaParams) (int64, error)
+	// operator_account.sql —— 运维登录账户 CRUD + 认证热路径
+	//
+	// 决策依据：ADR-0008（管理后台会话认证）
+	// 实施计划：docs/plans/2026-05-31-001-feat-admin-console-config-plan.md Unit 2（供 Unit 3 operator service）
+	//
+	// 安全约定：
+	//   - password_hash 是 bcrypt(口令) hex；明文绝不入库。
+	//   - **仅** GetOperatorAccountByUsername 返回 password_hash（认证用）；List / 其余视图绝不回显哈希。
+	//   - 认证由 service 层（Unit 3）用 bcrypt.CompareHashAndPassword 完成；本层只取哈希。
+	// 创建运维账户；password_hash 由 service 层 bcrypt 后传入。
+	// created_by：初始管理员种子为 'seed'，后台开通为 'operator:<id>'。
+	// username 唯一冲突 → service 层判 ErrUsernameExists（SQLSTATE 23505）。
+	InsertOperatorAccount(ctx context.Context, arg InsertOperatorAccountParams) (InsertOperatorAccountRow, error)
 	// outbox.sql —— webhook_event_outbox 写路径
 	//
 	// 本工作流仅实现 INSERT；dispatcher（claim/lease 抢占 + 推送 + DLQ）由 C-min 落地。
@@ -243,6 +282,8 @@ type Querier interface {
 	ListAllUnfrozenAccountsForReconciler(ctx context.Context) ([]ListAllUnfrozenAccountsForReconcilerRow, error)
 	// 列出账户的全部授权 model（admin / 运维）。
 	ListEntitlementsByAccount(ctx context.Context, businessAccountID string) ([]BusinessAccountModelEntitlement, error)
+	// 列出全部运维账户（**不含 password_hash**）；后台账户管理用。按 created_at DESC。
+	ListOperatorAccounts(ctx context.Context) ([]ListOperatorAccountsRow, error)
 	// reconciler 收尾 watchdog：扫出处于 rebuild_in_progress 状态且 frozen 时间过长的账户。
 	//
 	// 用途：U8 RebuildBalance 三事务流程中第二阶段崩溃 / 进程被 kill 时，账户会停留在
@@ -370,6 +411,9 @@ type Querier interface {
 	ScanSubmittedNoJob(ctx context.Context, arg ScanSubmittedNoJobParams) ([]Task, error)
 	// 启用 / 停用渠道（软下线优先于硬删除）。
 	SetChannelEnabled(ctx context.Context, arg SetChannelEnabledParams) (SetChannelEnabledRow, error)
+	// 启用 / 禁用账户（禁用即时阻断后续登录；已建会话由禁用账户校验失效）。
+	// 不存在 id 返 0 rows → service 判 ErrNotFound。
+	SetOperatorAccountEnabled(ctx context.Context, arg SetOperatorAccountEnabledParams) (SetOperatorAccountEnabledRow, error)
 	// ============================================================================
 	// 3. drift reconciler 聚合
 	// ============================================================================
@@ -377,6 +421,8 @@ type Querier interface {
 	// 与 balance 表比对得 drift。recharge_sum / refund_sum 用 FILTER 仅累加对应 entry_type。
 	// COALESCE 兜底 NULL（账户 0 条 ledger 时 SUM 返回 NULL）。
 	SumLedgerDeltasByAccount(ctx context.Context, businessAccountID string) (SumLedgerDeltasByAccountRow, error)
+	// 异步 best-effort 更新 last_seen_at（审计 / 可选续期）；失败不影响鉴权主路径。
+	TouchAdminSessionLastSeen(ctx context.Context, id int64) error
 	// ============================================================================
 	// 3. 鉴权命中异步更新（best-effort）
 	// ============================================================================
@@ -393,6 +439,8 @@ type Querier interface {
 	// 更新渠道凭据密文 + KEK 版本（凭据轮换 / KEK 重加密命令用，ADR-0006 决策 4）。
 	// 仅动密文与版本，不碰其他配置；明文绝不入库。
 	UpdateChannelCredentials(ctx context.Context, arg UpdateChannelCredentialsParams) (Channel, error)
+	// 改口令（password_hash 由 service bcrypt 后传入）；返回受影响行数判断是否存在。
+	UpdateOperatorPassword(ctx context.Context, arg UpdateOperatorPasswordParams) (int64, error)
 }
 
 var _ Querier = (*Queries)(nil)

@@ -302,6 +302,19 @@ type AccountModelConcurrency struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// PG 会话（管理后台；ADR-0008 决策 3）；存 token 的 HMAC 而非明文
+type AdminSession struct {
+	ID int64 `json:"id"`
+	// HMAC(pepper, 会话明文 token) hex；明文仅在 HttpOnly Cookie
+	SessionTokenHash string `json:"session_token_hash"`
+	OperatorID       int64  `json:"operator_id"`
+	// 每会话 CSRF token；会话通道状态变更请求须带；Bearer 通道豁免
+	CsrfToken  string       `json:"csrf_token"`
+	ExpiresAt  time.Time    `json:"expires_at"`
+	CreatedAt  time.Time    `json:"created_at"`
+	LastSeenAt sql.NullTime `json:"last_seen_at"`
+}
+
 // 业务账户：业务系统侧企业账户在网关侧的镜像（CONTEXT.md business_account）
 type BusinessAccount struct {
 	ID     string                `json:"id"`
@@ -477,6 +490,19 @@ type GatewayAdminTokenUsage struct {
 	// 当日累计成功创建账户次数
 	AccountCreateCount int32     `json:"account_create_count"`
 	UpdatedAt          time.Time `json:"updated_at"`
+}
+
+// 运维登录账户（管理后台会话认证；ADR-0008）；初始管理员 env 种子，其余后台开通
+type OperatorAccount struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+	// bcrypt(口令)；低熵口令慢哈希；明文/哈希绝不回显/不入日志
+	PasswordHash string `json:"password_hash"`
+	// 软禁用；false 拒绝登录
+	Enabled   bool      `json:"enabled"`
+	CreatedBy string    `json:"created_by"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // 成功任务转存到企业 TOS 的产物对象持久元数据；签名 URL 读时现签不入库（Unit 9）

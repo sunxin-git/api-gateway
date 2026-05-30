@@ -161,7 +161,7 @@ origin: docs/brainstorms/2026-05-31-gateway-admin-console-config-requirements.md
 
 ### Phase 1 — 会话认证后端
 
-- [ ] **Unit 2: 认证 schema + sqlc（operator_account + admin_session）**
+- [x] **Unit 2: 认证 schema + sqlc（operator_account + admin_session）**
 
 **Goal:** 建运维账户表与会话表 + sqlc 查询。
 
