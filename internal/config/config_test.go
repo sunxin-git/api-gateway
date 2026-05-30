@@ -379,6 +379,70 @@ func TestAsync_DisabledSkipsConcurrencyValidation(t *testing.T) {
 	assert.False(t, cfg.AsyncEnabled)
 }
 
+// ===== Phase 2 视频中继（Unit 4）配置 =====
+
+func TestVideoRelay_DefaultsAndDisabled(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.False(t, cfg.VideoRelayEnabled, "默认不启用视频中继")
+	// 取值档默认值（即便未启用也已装载，供 Unit 10 装配时构造 catalog）
+	assert.Equal(t, "volc_seedance", cfg.VideoRelayProviderType)
+	assert.Equal(t, int64(11000), cfg.VideoRelayBillingMultiplierBP)
+	assert.Equal(t, int64(4), cfg.VideoRelayDurationMinSeconds)
+	assert.Equal(t, int64(15), cfg.VideoRelayDurationMaxSeconds)
+	assert.Equal(t, int64(5), cfg.VideoRelayDurationDefaultSeconds)
+	assert.Equal(t, int64(24), cfg.VideoRelayFpsDefault)
+	assert.Equal(t, int64(30), cfg.VideoRelayFpsMax)
+	assert.Equal(t, []string{"16:9", "9:16", "1:1", "adaptive"}, cfg.VideoRelayRatios)
+	assert.Equal(t, "16:9", cfg.VideoRelayRatioDefault)
+	assert.Equal(t, "720p", cfg.VideoRelayResolutionDefault)
+}
+
+func TestVideoRelay_EnvOverride(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_ASYNC_ENABLED", "true") // 视频中继依赖异步基座
+	t.Setenv("GATEWAY_VIDEO_RELAY_ENABLED", "true")
+	t.Setenv("GATEWAY_VIDEO_RELAY_MODEL_NAME", "gw-video")
+	t.Setenv("GATEWAY_VIDEO_RELAY_CHANNEL_NAME", "seedance-main")
+	t.Setenv("GATEWAY_VIDEO_RELAY_PRICE_720P_PER_1M_MINOR", "4600")
+	t.Setenv("GATEWAY_VIDEO_RELAY_BILLING_MULTIPLIER_BP", "12000")
+	t.Setenv("GATEWAY_VIDEO_RELAY_RATIOS", "16:9, 1:1")
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.True(t, cfg.VideoRelayEnabled)
+	assert.Equal(t, "gw-video", cfg.VideoRelayModelName)
+	assert.Equal(t, "seedance-main", cfg.VideoRelayChannelName)
+	assert.Equal(t, int64(4600), cfg.VideoRelayPrice720pPer1MMinor)
+	assert.Equal(t, int64(12000), cfg.VideoRelayBillingMultiplierBP)
+	assert.Equal(t, []string{"16:9", "1:1"}, cfg.VideoRelayRatios)
+}
+
+// 视频中继依赖异步基座：启用视频中继但未启用异步 → fail-fast。
+func TestVideoRelay_RequiresAsyncEnabled(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	t.Setenv("GATEWAY_VIDEO_RELAY_ENABLED", "true")
+	// 故意不设 GATEWAY_ASYNC_ENABLED（默认 false）
+
+	_, err := Load("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "GATEWAY_ASYNC_ENABLED")
+}
+
+func TestVideoRelay_DisabledSkipsDependencyCheck(t *testing.T) {
+	clearGatewayEnv(t)
+	setMinimalRequiredEnv(t)
+	// VideoRelayEnabled=false（默认）→ 不校验 async 依赖，照常启动。
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.False(t, cfg.VideoRelayEnabled)
+}
+
 // clearGatewayEnv 清掉本测试关心的所有 env，避免外部环境干扰。
 func clearGatewayEnv(t *testing.T) {
 	t.Helper()
@@ -404,6 +468,13 @@ func clearGatewayEnv(t *testing.T) {
 		// Phase 2 异步基座
 		"GATEWAY_ASYNC_ENABLED",
 		"GATEWAY_ASYNC_CONCURRENCY",
+		// Phase 2 视频中继（Unit 4）
+		"GATEWAY_VIDEO_RELAY_ENABLED",
+		"GATEWAY_VIDEO_RELAY_MODEL_NAME",
+		"GATEWAY_VIDEO_RELAY_CHANNEL_NAME",
+		"GATEWAY_VIDEO_RELAY_BILLING_MULTIPLIER_BP",
+		"GATEWAY_VIDEO_RELAY_DURATION_MAX_SECONDS",
+		"GATEWAY_VIDEO_RELAY_RATIOS",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")

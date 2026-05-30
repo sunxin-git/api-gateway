@@ -70,6 +70,31 @@ const (
 	// Redis 认证 / TLS（评审 #9：生产 Redis 须支持 ACL/mTLS）。
 	keyRedisPassword   = "gateway_redis_password"
 	keyRedisTLSEnabled = "gateway_redis_tls_enabled"
+
+	// Phase 2 异步视频中继（Unit 4）新增（GATEWAY_VIDEO_RELAY_* 视频字典配置）。
+	// VideoRelayEnabled=false（默认）时 /v1/video/* 路由不注册；=true 时 main.go（Unit 10）
+	// 用以下字段构造 video.NewEnvVideoCatalog（fail-fast 校验在该构造内，与 RelayEnabled 同风格）。
+	keyVideoRelayEnabled           = "gateway_video_relay_enabled"
+	keyVideoRelayModelName         = "gateway_video_relay_model_name"
+	keyVideoRelayProviderType      = "gateway_video_relay_provider_type"
+	keyVideoRelayUpstreamBaseURL   = "gateway_video_relay_upstream_base_url"
+	keyVideoRelayUpstreamModelName = "gateway_video_relay_upstream_model_name"
+	keyVideoRelayChannelName       = "gateway_video_relay_channel_name"
+	// 分辨率档单价（CNY 分 / 百万 token）；0 = 该档不在售（至少一档 > 0）。
+	keyVideoRelayPrice480pPer1MMinor  = "gateway_video_relay_price_480p_per_1m_minor"
+	keyVideoRelayPrice720pPer1MMinor  = "gateway_video_relay_price_720p_per_1m_minor"
+	keyVideoRelayPrice1080pPer1MMinor = "gateway_video_relay_price_1080p_per_1m_minor"
+	// 商业加价倍率基点（10000=1.0×，默认 11000=1.1×，对齐参考实现 video_credit_multiplier）。
+	keyVideoRelayBillingMultiplierBP = "gateway_video_relay_billing_multiplier_bp"
+	// 取值档（能力描述符约束来源；均有默认值，最小配置只需填 model/channel/价格）。
+	keyVideoRelayDurationMinSeconds     = "gateway_video_relay_duration_min_seconds"
+	keyVideoRelayDurationMaxSeconds     = "gateway_video_relay_duration_max_seconds"
+	keyVideoRelayDurationDefaultSeconds = "gateway_video_relay_duration_default_seconds"
+	keyVideoRelayFpsDefault             = "gateway_video_relay_fps_default"
+	keyVideoRelayFpsMax                 = "gateway_video_relay_fps_max"
+	keyVideoRelayRatios                 = "gateway_video_relay_ratios"
+	keyVideoRelayRatioDefault           = "gateway_video_relay_ratio_default"
+	keyVideoRelayResolutionDefault      = "gateway_video_relay_resolution_default"
 )
 
 // asyncConcurrency 上下界（仅 AsyncEnabled 时校验）。
@@ -185,6 +210,43 @@ type Config struct {
 	// AsyncConcurrency Asynq server worker 池大小，默认 10。
 	// 这是**执行层吞吐**（一次跑几个 job），非 R15 业务并发上限（后者走 DB 原子 claim，ADR-0006）。
 	AsyncConcurrency int
+
+	// ===== Phase 2 异步视频中继（Unit 4）新增（GATEWAY_VIDEO_RELAY_* 视频字典配置） =====
+
+	// VideoRelayEnabled 是否启用视频中继路由 /v1/video/*（默认 false）。
+	// =true 时 main.go（Unit 10）用以下字段构造 video.NewEnvVideoCatalog（字段自洽 fail-fast 在
+	// 该构造内，避免与 config 重复校验）。**强制依赖 AsyncEnabled=true**（视频走异步基座），
+	// validate 落实此跨字段依赖。
+	VideoRelayEnabled bool
+
+	// VideoRelayModelName 业务可见视频 model 名（如 "gw-video"）。
+	VideoRelayModelName string
+	// VideoRelayProviderType 视频 provider 协议簇；MVP 唯一 "volc_seedance"，默认即此。
+	VideoRelayProviderType string
+	// VideoRelayUpstreamBaseURL 上游 base url（不含 endpoint path）；production 强制 https。
+	VideoRelayUpstreamBaseURL string
+	// VideoRelayUpstreamModelName 上游真实 model 名（如 "doubao-seedance-2-0-..."）。
+	VideoRelayUpstreamModelName string
+	// VideoRelayChannelName 绑定的 channel 名（凭据来源；Unit 3 channel service 据此取凭据）。
+	VideoRelayChannelName string
+
+	// VideoRelayPrice{480p,720p,1080p}Per1MMinor 各分辨率档单价（CNY 分 / 百万 token）。
+	// 0 = 该档不在售（不进 capability 枚举、不进定价表）；至少一档须 > 0（catalog fail-fast）。
+	VideoRelayPrice480pPer1MMinor  int64
+	VideoRelayPrice720pPer1MMinor  int64
+	VideoRelayPrice1080pPer1MMinor int64
+	// VideoRelayBillingMultiplierBP 商业加价倍率基点（10000=1.0×），默认 11000=1.1×。
+	VideoRelayBillingMultiplierBP int64
+
+	// 取值档（能力描述符约束来源；均有默认值）。
+	VideoRelayDurationMinSeconds     int64
+	VideoRelayDurationMaxSeconds     int64
+	VideoRelayDurationDefaultSeconds int64
+	VideoRelayFpsDefault             int64
+	VideoRelayFpsMax                 int64
+	VideoRelayRatios                 []string // aspect ratio 枚举（CSV 解析）
+	VideoRelayRatioDefault           string
+	VideoRelayResolutionDefault      string
 }
 
 // Load 加载并校验配置。
@@ -211,6 +273,19 @@ func Load(envFilePath string) (*Config, error) {
 		keyAsyncEnabled:              "false", // 默认不启用异步基座 → 零 Redis 依赖
 		keyAsyncConcurrency:          10,
 		keyRedisTLSEnabled:           "false",
+
+		// Phase 2 视频中继默认值（仅 VideoRelayEnabled=true 时这些档生效）。
+		keyVideoRelayEnabled:                "false",
+		keyVideoRelayProviderType:           "volc_seedance",
+		keyVideoRelayBillingMultiplierBP:    11000, // 1.1×（参考实现 video_credit_multiplier）
+		keyVideoRelayDurationMinSeconds:     4,
+		keyVideoRelayDurationMaxSeconds:     15,
+		keyVideoRelayDurationDefaultSeconds: 5,
+		keyVideoRelayFpsDefault:             24,
+		keyVideoRelayFpsMax:                 30,
+		keyVideoRelayRatios:                 "16:9,9:16,1:1,adaptive",
+		keyVideoRelayRatioDefault:           "16:9",
+		keyVideoRelayResolutionDefault:      "720p",
 	}
 	if err := k.Load(mapProvider(defaults), nil); err != nil {
 		return nil, fmt.Errorf("加载默认值失败: %w", err)
@@ -287,6 +362,26 @@ func Load(envFilePath string) (*Config, error) {
 		AsyncConcurrency: int(k.Int64(keyAsyncConcurrency)),
 		RedisPassword:    k.String(keyRedisPassword),
 		RedisTLSEnabled:  k.Bool(keyRedisTLSEnabled),
+
+		VideoRelayEnabled:              k.Bool(keyVideoRelayEnabled),
+		VideoRelayModelName:            k.String(keyVideoRelayModelName),
+		VideoRelayProviderType:         k.String(keyVideoRelayProviderType),
+		VideoRelayUpstreamBaseURL:      k.String(keyVideoRelayUpstreamBaseURL),
+		VideoRelayUpstreamModelName:    k.String(keyVideoRelayUpstreamModelName),
+		VideoRelayChannelName:          k.String(keyVideoRelayChannelName),
+		VideoRelayPrice480pPer1MMinor:  k.Int64(keyVideoRelayPrice480pPer1MMinor),
+		VideoRelayPrice720pPer1MMinor:  k.Int64(keyVideoRelayPrice720pPer1MMinor),
+		VideoRelayPrice1080pPer1MMinor: k.Int64(keyVideoRelayPrice1080pPer1MMinor),
+		VideoRelayBillingMultiplierBP:  k.Int64(keyVideoRelayBillingMultiplierBP),
+
+		VideoRelayDurationMinSeconds:     k.Int64(keyVideoRelayDurationMinSeconds),
+		VideoRelayDurationMaxSeconds:     k.Int64(keyVideoRelayDurationMaxSeconds),
+		VideoRelayDurationDefaultSeconds: k.Int64(keyVideoRelayDurationDefaultSeconds),
+		VideoRelayFpsDefault:             k.Int64(keyVideoRelayFpsDefault),
+		VideoRelayFpsMax:                 k.Int64(keyVideoRelayFpsMax),
+		VideoRelayRatios:                 parseOrigins(k.String(keyVideoRelayRatios)),
+		VideoRelayRatioDefault:           k.String(keyVideoRelayRatioDefault),
+		VideoRelayResolutionDefault:      k.String(keyVideoRelayResolutionDefault),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -366,6 +461,17 @@ func (c *Config) validate() error {
 				c.AsyncConcurrency, minAsyncConcurrency, maxAsyncConcurrency,
 			)
 		}
+	}
+
+	// ===== Phase 2 视频中继跨字段依赖校验（Unit 4） =====
+	// 视频中继走异步基座（Asynq submit/settle/recover/poll），故启用视频中继必须同时启用异步基座。
+	// 视频字典字段自洽（model/price/取值档）的 fail-fast 在 video.NewEnvVideoCatalog（main.go 装配），
+	// 不在此重复——config 只负责跨字段依赖，catalog 负责单字段合法性（与 RelayEnabled 同分工）。
+	if c.VideoRelayEnabled && !c.AsyncEnabled {
+		return errors.New(
+			"GATEWAY_VIDEO_RELAY_ENABLED=true 时必须同时设置 GATEWAY_ASYNC_ENABLED=true" +
+				"（视频中继依赖异步执行基座 Asynq+Redis）",
+		)
 	}
 
 	return nil
