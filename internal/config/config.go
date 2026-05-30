@@ -53,6 +53,9 @@ const (
 	keyAdminBootstrapUsername = "gateway_admin_bootstrap_username"
 	keyAdminBootstrapPassword = "gateway_admin_bootstrap_password"
 
+	// 管理后台配置线 Unit 4 新增（ADR-0008：会话 TTL）。
+	keyAdminSessionTTLSeconds = "gateway_admin_session_ttl_seconds"
+
 	// F-min Unit 7 新增（relay 业务路由 /v1 配置）。
 	// RelayEnabled=false（默认）时 /v1 路由不注册（admin-only 部署）；
 	// =true 时 8 个 RELAY_* 字段经 relay.NewEnvCatalog fail-fast 校验（main.go 装配时）。
@@ -206,6 +209,9 @@ type Config struct {
 	AdminBootstrapUsername string `json:"-"` // 防序列化泄露（认证路径一半，与口令同惯例）
 	AdminBootstrapPassword string `json:"-"` // 防序列化泄露
 
+	// AdminSessionTTLSeconds 管理后台会话有效期（秒，ADR-0008）；默认 43200（12h）。
+	AdminSessionTTLSeconds int64
+
 	// ===== F-min Unit 7 新增（relay 业务路由 /v1 配置） =====
 
 	// RelayEnabled 是否启用 relay 业务路由 /v1/chat/completions（默认 false = admin-only 部署）。
@@ -332,6 +338,7 @@ func Load(envFilePath string) (*Config, error) {
 		keyVideoRelayRatioDefault:           "16:9",
 		keyVideoRelayResolutionDefault:      "720p",
 		keyVideoRelayConcurrencyDefault:     5,     // 账户×模型并发默认上限（Unit 8）
+		keyAdminSessionTTLSeconds:           43200, // 管理后台会话 TTL，12h（Unit 4）
 		keyVideoRelaySafetyFactorBP:         12000, // 1.2×（reserve 安全系数，Unit 7/10）
 		keyVideoRelayMinTokenFloor:          0,     // 默认无最低 token 下限（落地核对 seedance 官方）
 		keyVideoResultURLTTLSeconds:         900,   // 15min 结果签名 URL TTL（Unit 10）
@@ -399,6 +406,7 @@ func Load(envFilePath string) (*Config, error) {
 		AdminAuditTier1Path:    k.String(keyAdminAuditTier1Path),
 		AdminBootstrapUsername: k.String(keyAdminBootstrapUsername),
 		AdminBootstrapPassword: k.String(keyAdminBootstrapPassword),
+		AdminSessionTTLSeconds: k.Int64(keyAdminSessionTTLSeconds),
 
 		RelayEnabled:               k.Bool(keyRelayEnabled),
 		RelayModelName:             k.String(keyRelayModelName),
