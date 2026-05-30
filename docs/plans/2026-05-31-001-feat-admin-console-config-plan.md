@@ -102,6 +102,11 @@ origin: docs/brainstorms/2026-05-31-gateway-admin-console-config-requirements.md
 - CSRF 具体形态（double-submit cookie vs 同步器 token）落地定。
 - 多单位定价表（token/video_second）字段统一表达（对齐设计 §5.1 + storyboard-assistant 定价表；落地核对）。
 - ClaimConcurrencySlot 加 COALESCE 覆写后的 EXPLAIN 复核（须附 PR）。
+- **会话认证安全硬化（Unit 4 安全审查 P2 遗留）**：
+  - csrf_token 当前明文存 PG（与 session_token_hash 不对称）→ 改存 HMAC 或由 session token 派生（防 DB 只读泄露后 CSRF 绕过）。
+  - 禁用 operator 账户时联动 `session.DeleteByOperator` 主动踢出已存会话（Unit 12 operator Admin API 落地）。
+  - 给 `/admin/login` 挂审计前须实现 request-hash 口令字段脱敏（Unit 13/16）。
+  - 登录限速当前为全局令牌桶；per-IP + 连续失败锁定为后续硬化。
 
 ## High-Level Technical Design
 
@@ -222,7 +227,7 @@ origin: docs/brainstorms/2026-05-31-gateway-admin-console-config-requirements.md
 
 **Verification:** 哈希往返 + 认证边界 + 种子幂等测试通过（真 PG）；明文/哈希不出现在任何输出。
 
-- [ ] **Unit 4: 会话中间件 + login/logout + CSRF + AdminPrincipal 归一化**
+- [x] **Unit 4: 会话中间件 + login/logout + CSRF + AdminPrincipal 归一化**
 
 **Goal:** 实现会话登录端点 + cookie→session 鉴权中间件（与 Bearer 并存）+ CSRF，并把 Throttle/Scope/Audit 改读统一 AdminPrincipal。
 

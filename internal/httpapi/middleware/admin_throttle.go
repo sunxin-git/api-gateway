@@ -31,11 +31,17 @@ func AdminThrottle(thr admintoken.Throttle, quotaExceededCounter *prometheus.Cou
 	return func(c *gin.Context) {
 		vr := GetAdminTokenValidation(c)
 		if vr == nil || vr.Token == nil {
-			// 防御性：AdminTokenAuth 应已注入；缺失视作 fail-closed
+			// operator（会话登录）无 admin_token → 跳过 token 级 throttle/熔断
+			// （ADR-0008：operator 受信内部、低频；其爆破防护见 login 端点 + bcrypt cost）。
+			if p := GetAdminPrincipal(c); p != nil && p.IsOperator() {
+				c.Next()
+				return
+			}
+			// 既非 token 也非 operator → fail-closed（AdminAuth 应已注入身份）
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 				"error": gin.H{
 					"code":       "internal_error",
-					"message":    "服务内部错误（throttle 缺少 token 上下文）",
+					"message":    "服务内部错误（throttle 缺少身份上下文）",
 					"request_id": GetRequestID(c),
 				},
 			})

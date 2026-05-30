@@ -107,8 +107,14 @@ func AdminAudit(
 				DurationMs:    duration.Milliseconds(),
 				OutcomeCode:   resolveOutcomeCode(c, status, bodyTooLarge),
 			}
-			// token meta（auth 通过才有）
-			if vr := GetAdminTokenValidation(c); vr != nil && vr.Token != nil {
+			// actor / token meta：优先归一化身份（支持 operator:<id>），回落旧 token 路径。
+			if p := GetAdminPrincipal(c); p != nil {
+				rec.Actor = p.AuditActor()
+				if p.Token != nil {
+					rec.TokenID = p.Token.ID
+					rec.TokenDescription = p.Token.Description
+				}
+			} else if vr := GetAdminTokenValidation(c); vr != nil && vr.Token != nil {
 				rec.TokenID = vr.Token.ID
 				rec.TokenDescription = vr.Token.Description
 				rec.Actor = "admin_token:" + strconv.FormatInt(vr.Token.ID, 10)

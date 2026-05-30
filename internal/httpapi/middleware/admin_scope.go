@@ -29,19 +29,33 @@ func AdminScope(svc admintoken.Service, requiredScope string, authFailedCounter 
 		panic("middleware.AdminScope: requiredScope 不能为空字符串（fail-closed）")
 	}
 	return func(c *gin.Context) {
-		vr := GetAdminTokenValidation(c)
-		if vr == nil || vr.Token == nil {
-			// 防御性：AdminTokenAuth 应已注入；缺失视作 fail-closed
+		p := GetAdminPrincipal(c)
+		if p == nil {
+			// 兼容仅设了 token 验证结果的旧路径（如直接用 AdminTokenAuth 的测试）
+			if vr := GetAdminTokenValidation(c); vr != nil && vr.Token != nil {
+				p = &AdminPrincipal{Kind: PrincipalKindAdminToken, Token: vr.Token}
+			}
+		}
+		if p == nil {
+			// 防御性：AdminAuth 应已注入；缺失视作 fail-closed
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 				"error": gin.H{
 					"code":       "internal_error",
-					"message":    "服务内部错误（scope check 缺少 token 上下文）",
+					"message":    "服务内部错误（scope check 缺少身份上下文）",
 					"request_id": GetRequestID(c),
 				},
 			})
 			return
 		}
-		if !svc.CheckScope(vr.Token, requiredScope) {
+
+		// operator（会话）拥有全部配置能力（ADR-0008 决策 4：单一运维角色）。
+		if p.IsOperator() {
+			c.Next()
+			return
+		}
+
+		// admin_token：按 token.Scopes 校验。
+		if p.Token == nil || !svc.CheckScope(p.Token, requiredScope) {
 			if authFailedCounter != nil {
 				authFailedCounter.WithLabelValues("insufficient_scope").Inc()
 			}

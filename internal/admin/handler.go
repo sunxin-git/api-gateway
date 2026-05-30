@@ -72,13 +72,23 @@ func NewHandler(l ledger.Service, t admintoken.Throttle, m *Metrics, log *slog.L
 //
 // outcome_code = "ok"（audit Tier2，read-only 无副作用）。
 func (h *Handler) Whoami(c *gin.Context) {
+	// operator（会话登录）身份：无 admin_token，返回 operator 专属视图（安全审查 P1-2）。
+	if p := middleware.GetAdminPrincipal(c); p != nil && p.IsOperator() {
+		c.JSON(http.StatusOK, gin.H{
+			"kind":              "operator",
+			"operator_id":       p.OperatorID,
+			"operator_username": p.OperatorUsername,
+		})
+		return
+	}
+
 	vr := middleware.GetAdminTokenValidation(c)
 	if vr == nil || vr.Token == nil {
 		// 防御性：中间件应已注入；缺失 → 500
 		respondError(c, errorMapping{
 			status:      http.StatusInternalServerError,
 			code:        "internal_error",
-			message:     "服务内部错误（whoami 缺少 token 上下文）",
+			message:     "服务内部错误（whoami 缺少身份上下文）",
 			outcomeCode: "internal_error",
 		})
 		return

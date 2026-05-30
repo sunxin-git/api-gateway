@@ -44,9 +44,11 @@ import (
 	"github.com/sunxin-git/api-gateway/internal/httpapi/middleware"
 	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/obs"
+	"github.com/sunxin-git/api-gateway/internal/operator"
 	"github.com/sunxin-git/api-gateway/internal/outbox"
 	"github.com/sunxin-git/api-gateway/internal/relay"
 	"github.com/sunxin-git/api-gateway/internal/relay/video"
+	"github.com/sunxin-git/api-gateway/internal/session"
 	"github.com/sunxin-git/api-gateway/internal/storage"
 	"github.com/sunxin-git/api-gateway/internal/task"
 )
@@ -162,6 +164,19 @@ func run() error {
 	// CIDR 启动期 sweep：发现 ip_allowlist 异常的 token 立刻 bump metric 告警
 	sweepAdminTokenCIDRs(context.Background(), adminTokenSvc, metrics, logger)
 
+	// 第 5bis 步：管理后台会话认证（ADR-0008 / Unit 4）。
+	// operator 账户 + PG 会话；启动时按 env 种子初始管理员（幂等；production 表空无种子 → fail-fast）。
+	operatorSvc := operator.NewPostgresService(pool, logger)
+	sessionSvc := session.NewPostgresService(pool, cfg.TokenPepperBytes,
+		time.Duration(cfg.AdminSessionTTLSeconds)*time.Second, logger)
+	if err := operator.Bootstrap(context.Background(), operatorSvc,
+		cfg.AdminBootstrapUsername, cfg.AdminBootstrapPassword,
+		cfg.GatewayEnv == config.EnvProduction, logger); err != nil {
+		return fmt.Errorf("初始管理员种子失败: %w", err)
+	}
+	sessionHandler := httpapi.NewSessionHandler(operatorSvc, sessionSvc,
+		cfg.GatewayEnv == config.EnvProduction, logger)
+
 	instanceID := hostnameOrUnknown()
 	rpm := admintoken.NewInProcessRPM(logger, func() {
 		metrics.AdminThrottleRPMColdStartTotal.WithLabelValues(instanceID).Inc()
@@ -197,8 +212,8 @@ func run() error {
 		return nil
 	})
 
-	// 第 7 步：注册 admin 路由组。
-	registerAdminRoutes(srv, adminHandler, adminTokenSvc, throttle, auditLogger, metrics)
+	// 第 7 步：注册 admin 路由组 + 会话登录/登出（Unit 4）。
+	registerAdminRoutes(srv, adminHandler, adminTokenSvc, sessionSvc, sessionHandler, throttle, auditLogger, metrics)
 
 	// 第 7bis 步：装配 + 注册业务 relay 路由组 /v1（仅 RelayEnabled=true 时）。
 	// admin-only 部署（RelayEnabled=false）跳过：不构造 businesskey / catalog / adapter，
@@ -535,26 +550,43 @@ func hasAuditWriteFailure(m *obs.Metrics) bool {
 	return false
 }
 
-// registerAdminRoutes 把 admin handler 5 个 endpoint 挂在 /admin/v1 路由组下，
-// 装好完整 5 件套中间件链 + HSTS。
+// registerAdminRoutes 注册管理后台路由：
+//   - /admin/login、/admin/logout（前置无鉴权；ADR-0008 / Unit 4 会话登录）
+//   - /admin/v1/*（业务账户等）链顺序：
+//     HSTS → AdminBodyLimit → AdminAuth(会话 OR Bearer) → AdminThrottle →
+//     AdminScope(handler-specific) → AdminAudit → handler
 //
-// 链顺序（plan Unit 4）：
-//
-//	HSTS → AdminBodyLimit → AdminTokenAuth → AdminThrottle →
-//	  AdminScope(handler-specific) → AdminAudit → handler
+// 鉴权由 AdminAuth 统一（会话 Cookie → operator 全配置能力；Bearer → admin_token scope）。
 func registerAdminRoutes(
 	srv *httpapi.Server,
 	h *admin.Handler,
 	tokenSvc admintoken.Service,
+	sessionSvc session.Service,
+	sessionH *httpapi.SessionHandler,
 	thr admintoken.Throttle,
 	auditLogger audit.AuditLogger,
 	m *obs.Metrics,
 ) {
+	// 会话登录 / 登出：前置无鉴权（HSTS + body 限制）。
+	// login 暂不挂 AdminAudit（其 body 含口令明文，request-hash 会纳入口令；
+	// 失败登录审计 + hash 豁免留 Unit 13/16）。
+	// 登录/登出全局令牌桶限速（复用通用令牌桶）：挡口令爆破洪泛（配合 bcrypt cost 12）。
+	// 全局而非 per-IP：内部后台、合法登录低频；per-IP 精细化 + 失败锁定留后续硬化（安全审查 P1-3）。
+	loginThrottle := middleware.NewCallbackThrottle(5, 10)
+	authGroup := srv.Engine().Group("/admin")
+	authGroup.Use(
+		middleware.HSTS(),
+		middleware.AdminBodyLimit(m.AdminAPIBodyTooLargeTotal),
+		loginThrottle.Middleware(),
+	)
+	authGroup.POST("/login", sessionH.Login)
+	authGroup.POST("/logout", sessionH.Logout)
+
 	g := srv.Engine().Group("/admin/v1")
 	g.Use(
 		middleware.HSTS(),
 		middleware.AdminBodyLimit(m.AdminAPIBodyTooLargeTotal),
-		middleware.AdminTokenAuth(tokenSvc, m.AdminAPIAuthFailedTotal),
+		middleware.AdminAuth(sessionSvc, tokenSvc, m.AdminAPIAuthFailedTotal),
 		middleware.AdminThrottle(thr, m.AdminAPIQuotaExceededTotal),
 	)
 

@@ -1,9 +1,7 @@
 package middleware
 
 import (
-	"errors"
 	"net/http"
-	"net/netip"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -38,39 +36,12 @@ const (
 //   - 失败路径**不**进入 throttle 阀门（next middleware 不被调用）
 func AdminTokenAuth(svc admintoken.Service, authFailedCounter *prometheus.CounterVec) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		plaintext, reason, ok := extractBearerToken(c.GetHeader("Authorization"))
+		vr, ok := validateBearerToken(c, svc, authFailedCounter)
 		if !ok {
-			respondAuthFailed(c, "unauthorized", "Admin Token 缺失或格式非法", authFailedCounter, reason)
 			return
 		}
-
-		// c.ClientIP() 已被 Gin 按 TrustedProxies 配置解析（Unit 7 fail-fast 装配）
-		clientIP, err := netip.ParseAddr(c.ClientIP())
-		if err != nil || !clientIP.IsValid() {
-			// IP 解析失败：fail-closed 拒绝（不允许走 ValidateByPlaintext 的零值路径）
-			respondAuthFailed(c, "ip_not_allowed", "源 IP 非法或缺失", authFailedCounter, "invalid_ip")
-			return
-		}
-
-		vr, err := svc.ValidateByPlaintext(c.Request.Context(), plaintext, clientIP)
-		if err != nil {
-			switch {
-			case errors.Is(err, admintoken.ErrTokenNotFound),
-				errors.Is(err, admintoken.ErrTokenRevoked),
-				errors.Is(err, admintoken.ErrTokenExpired):
-				respondAuthFailed(c, "unauthorized", "Admin Token 无效", authFailedCounter, "token_invalid")
-			case errors.Is(err, admintoken.ErrIPNotAllowed):
-				respondAuthFailed(c, "ip_not_allowed", "源 IP 不在白名单内", authFailedCounter, "ip_not_allowed")
-			default:
-				// 系统错误（DB 故障等）；不暴露具体错误给客户端
-				respondAuthFailed(c, "internal_error", "服务内部错误", authFailedCounter, "internal_error")
-				_ = c.Error(err)
-				c.AbortWithStatus(http.StatusInternalServerError)
-			}
-			return
-		}
-
-		c.Set(CtxKeyAdminToken, vr)
+		// Bearer 成功也注入归一化身份（ADR-0008 决策 4：下游 Scope/Audit 统一读 AdminPrincipal）。
+		SetAdminPrincipal(c, &AdminPrincipal{Kind: PrincipalKindAdminToken, Token: vr.Token})
 		c.Next()
 	}
 }
