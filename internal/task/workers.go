@@ -24,6 +24,9 @@ import (
 const (
 	TypeSubmit = "video:submit"
 	TypeSettle = "video:settle"
+	// TypeStore 结果转存（Unit 9）：成功结算后下载上游产物 → 上传企业 TOS → 写 oss_object_meta。
+	// 独立 job（非 settle 内联）：多 MB 下载+上传不阻塞动钱的 settle 关键队列。
+	TypeStore = "video:store"
 
 	// 6b 周期兜底 sweep 类型（main.go 用 asynq Scheduler 注册 cron → 入队 → 下列 handler）。
 	TypeReconcileFetch = "video:reconcile-fetch"
@@ -41,6 +44,8 @@ type taskIDPayload struct {
 type Enqueuer interface {
 	EnqueueSubmit(ctx context.Context, taskID string) error
 	EnqueueSettle(ctx context.Context, taskID string) error
+	// EnqueueStore 入队结果转存（Unit 9；成功结算后触发，QueueLow 背景转存）。
+	EnqueueStore(ctx context.Context, taskID string) error
 }
 
 // AsynqEnqueuer 用 asynq.Client 把 submit/settle job 投入对应优先级队列。
@@ -85,6 +90,11 @@ func (e *AsynqEnqueuer) EnqueueSettle(ctx context.Context, taskID string) error 
 	return e.enqueue(ctx, TypeSettle, taskID, asyncq.QueueCritical)
 }
 
+// EnqueueStore 把结果转存投入 QueueLow（背景媒体转存，不与 submit/settle 抢吞吐）。
+func (e *AsynqEnqueuer) EnqueueStore(ctx context.Context, taskID string) error {
+	return e.enqueue(ctx, TypeStore, taskID, asyncq.QueueLow)
+}
+
 // Close 关闭底层 asynq client（main.go 停机序列在 Asynq server 停机后调用，确保 worker 已排空）。
 func (e *AsynqEnqueuer) Close() error { return e.client.Close() }
 
@@ -94,6 +104,7 @@ func (e *AsynqEnqueuer) Close() error { return e.client.Close() }
 func (s *Service) RegisterHandlers(mux *asynq.ServeMux) {
 	mux.HandleFunc(TypeSubmit, s.HandleSubmit)
 	mux.HandleFunc(TypeSettle, s.HandleSettle)
+	mux.HandleFunc(TypeStore, s.HandleStore)
 	mux.HandleFunc(TypeReconcileFetch, s.HandleReconcileFetch)
 	mux.HandleFunc(TypeRecover, s.HandleRecover)
 	mux.HandleFunc(TypeExpire, s.HandleExpire)
@@ -134,6 +145,15 @@ func (s *Service) HandleSettle(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("settle: 非法 payload: %w", err)
 	}
 	return s.settleTask(ctx, p.TaskID)
+}
+
+// HandleStore store job 入口（解 payload → storeResult；Unit 9）。
+func (s *Service) HandleStore(ctx context.Context, t *asynq.Task) error {
+	var p taskIDPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("store: 非法 payload: %w", err)
+	}
+	return s.storeResult(ctx, p.TaskID)
 }
 
 // handleSubmit submit worker 核心：CAS 抢占 → 调上游 Submit → 存 upstream_task_id（plan §Unit 6）。

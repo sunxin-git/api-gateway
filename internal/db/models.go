@@ -479,6 +479,21 @@ type GatewayAdminTokenUsage struct {
 	UpdatedAt          time.Time `json:"updated_at"`
 }
 
+// 成功任务转存到企业 TOS 的产物对象持久元数据；签名 URL 读时现签不入库（Unit 9）
+type OssObjectMetum struct {
+	TaskID            string `json:"task_id"`
+	BusinessAccountID string `json:"business_account_id"`
+	// 转存时绑定的 channel TOS bucket 快照（换 bucket 不影响已存对象取回）
+	Bucket string `json:"bucket"`
+	// TOS 对象 key，含不可枚举随机段 + project_id 隔离前缀；不可枚举
+	ObjectKey   string    `json:"object_key"`
+	Region      string    `json:"region"`
+	Endpoint    string    `json:"endpoint"`
+	ContentType string    `json:"content_type"`
+	SizeBytes   int64     `json:"size_bytes"`
+	StoredAt    time.Time `json:"stored_at"`
+}
+
 // 异步任务：长耗时上游调用的本地记录（CONTEXT.md task）
 type Task struct {
 	ID                string      `json:"id"`

@@ -66,6 +66,7 @@ type fakeEnqueuer struct {
 	mu      sync.Mutex
 	submits []string
 	settles []string
+	stores  []string
 }
 
 func (f *fakeEnqueuer) EnqueueSubmit(_ context.Context, id string) error {
@@ -82,10 +83,23 @@ func (f *fakeEnqueuer) EnqueueSettle(_ context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeEnqueuer) EnqueueStore(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stores = append(f.stores, id)
+	return nil
+}
+
 func (f *fakeEnqueuer) settleCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.settles)
+}
+
+func (f *fakeEnqueuer) storeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.stores)
 }
 
 type fakeCreds struct{ apiKey string }
@@ -276,6 +290,7 @@ func (s *taskSuite) cleanup() {
 	defer conn.Release()
 	_, _ = conn.Exec(ctx, "SET session_replication_role = 'replica'")
 	defer func() { _, _ = conn.Exec(context.Background(), "SET session_replication_role = 'origin'") }()
+	_, _ = conn.Exec(ctx, "DELETE FROM oss_object_meta WHERE business_account_id = $1", s.accountID)
 	_, _ = conn.Exec(ctx, "DELETE FROM task WHERE business_account_id = $1", s.accountID)
 	_, _ = conn.Exec(ctx, "DELETE FROM account_model_concurrency WHERE business_account_id = $1", s.accountID)
 	_, _ = conn.Exec(ctx, "DELETE FROM business_account_ledger WHERE business_account_id = $1", s.accountID)

@@ -118,6 +118,8 @@ type Querier interface {
 	// rebuild TX2 用：按 id ASC 全量取 ledger，应用层累加得 expected balance。
 	// ORDER BY id 保证回放顺序与原写入顺序一致（虽然累加是可交换的，方便审计）。
 	GetLedgerEntriesForRebuild(ctx context.Context, businessAccountID string) ([]GetLedgerEntriesForRebuildRow, error)
+	// 按 task_id 取产物元数据（store 幂等判存 + Unit 10 GET 现签 URL 用）。不命中返 0 rows。
+	GetOSSObjectMetaByTask(ctx context.Context, taskID string) (OssObjectMetum, error)
 	// 内部按 id 查任务（worker / reconciler 用，不做归属过滤）。
 	GetTaskByID(ctx context.Context, id string) (Task, error)
 	// 按上游 task_id 反查本地任务（回调入口 / fetch reconciler 用）。
@@ -190,6 +192,15 @@ type Querier interface {
 	//   key_version 标记加密用的 KEK 版本，支持轮换（ADR-0006 决策 4）。
 	// 创建渠道；credentials_encrypted 由 service 层（Unit 3）用 KEK 加密后传入。
 	InsertChannel(ctx context.Context, arg InsertChannelParams) (Channel, error)
+	// oss_object_meta.sql —— TOS 结果对象元数据 CRUD + 转存恢复扫描（Phase 2 Unit 9）
+	//
+	// 实施计划：docs/plans/2026-05-28-001-feat-async-video-relay-mvp-plan.md Unit 9
+	// 决策：ADR-0006 决策 3（官方 TOS SDK；结果对象 + 受限签名 URL）
+	//
+	// 不存签名 URL / 上游源 URL（见 migration 0010 说明）；PK=task_id 天然幂等。
+	// 记录转存产物元数据；ON CONFLICT DO NOTHING 实现幂等（重复 store / 并发重投命中 PK 冲突 → 0 行）。
+	// 返回受影响行数：1 = 本次插入，0 = 已存在（幂等跳过）。
+	InsertOSSObjectMeta(ctx context.Context, arg InsertOSSObjectMetaParams) (int64, error)
 	// outbox.sql —— webhook_event_outbox 写路径
 	//
 	// 本工作流仅实现 INSERT；dispatcher（claim/lease 抢占 + 推送 + DLQ）由 C-min 落地。
@@ -335,6 +346,15 @@ type Querier interface {
 	// ADR-0006 决策 5：上游无幂等键/不可反查 → 这些任务 fail-closed（不自动重投），
 	// 调用方据此 CAS→FAILED + release + 告警。用 idx_task_submit_recover。
 	ScanRecoverableTasks(ctx context.Context, arg ScanRecoverableTasksParams) ([]Task, error)
+	// 转存恢复扫描（6b fetch reconciler 兜底丢失 / 失败的 store job）：
+	// 扫「COMPLETED 来源已 SETTLED（error_code 为空）、结算超阈值仍无 oss_object_meta、且上游 URL 仍在
+	// 24h 有效窗口内」的任务 → 调用方幂等重投 store。
+	//   - status='SETTLED' + error_code IS NULL ⟺ COMPLETED 来源成功结算（失败来源 error_code 非空；
+	//     缺 usage 者为 SETTLE_FAILED，状态不同，均被排除）。
+	//   - terminal_at >= @url_valid_after（= now-24h）：上游 video_url 仅 24h 有效，超窗无法转存 → 不再扫
+	//     （转人工对账，避免无效重投）。
+	//   - updated_at < @stale_before（= now-阈值）：只扫结算已过阈值仍无 meta 者，避让正常 store job 刚跑的新任务。
+	ScanSettledNeedingStore(ctx context.Context, arg ScanSettledNeedingStoreParams) ([]Task, error)
 	// fetch reconciler（6b）：扫 SETTLING 滞留超阈值的任务——硬崩溃于 commit/release 落账后、
 	// 终态 CAS（SETTLING→SETTLED/SETTLE_FAILED）前，task 卡 SETTLING（钱可能已落账、态未终）。
 	// 调用方幂等重投 settle 恢复：先反查 active reserve 判钱是否已落账，已落账→直接 finalize SETTLED，

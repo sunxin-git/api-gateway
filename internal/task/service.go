@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/sunxin-git/api-gateway/internal/db"
 	"github.com/sunxin-git/api-gateway/internal/ledger"
 	"github.com/sunxin-git/api-gateway/internal/relay/video"
+	"github.com/sunxin-git/api-gateway/internal/storage"
 )
 
 // referenceTypeVideoTask ledger reserve/commit/release 的 reference_type（运维按此 SUM 对账）。
@@ -53,6 +55,16 @@ type Service struct {
 	// callbackBaseURL 回调入口 base URL（如 https://gw.example.com）；空 = 不注册回调、纯轮询兜底（6a）。
 	//   submit worker 据此 + per-task token 构造交给上游的回调 URL（含 token 的 URL 绝不入日志）。
 	callbackBaseURL string
+
+	// --- Unit 9 结果转存 ---
+	// objectStoreFactory 由 per-channel TOS 凭据构造结果对象存储；nil → 结果转存禁用（store job no-op）。
+	objectStoreFactory func(storage.TOSConfig) (storage.ObjectStore, error)
+	// resultHTTPClient 拉取上游产物的 HTTP 客户端（带超时）。
+	resultHTTPClient *http.Client
+	// maxResultBytes 产物最大字节（防 OOM；超限转人工对账）。
+	maxResultBytes int64
+	// allowPrivateResultHost 仅测试置 true（httptest 走 127.0.0.1）；生产 false → 产物 URL SSRF 私网拒绝。
+	allowPrivateResultHost bool
 	// submitLeaseTTL submit worker 抢占 lease 时长（recover 据此判过期，6b）。
 	submitLeaseTTL time.Duration
 	// settleTO settle 的 ledger commit/release 独立 ctx 超时。
@@ -75,6 +87,8 @@ type Service struct {
 	// orphanReserveMinAge 孤儿 reserve 最小年龄阈值：只回收确陈旧者，防误回收 in-flight 窗口内
 	//   reserve 已落、task tx 即将提交的 reserve（须 ≫ reserve→task tx 正常间隔）。
 	orphanReserveMinAge time.Duration
+	// storeNeedingStoreAge SETTLED（COMPLETED 来源）多久仍无 oss_object_meta 判「store job 丢失」→ 恢复重投（Unit 9）。
+	storeNeedingStoreAge time.Duration
 	// sweepBatchSize 各 sweep 单轮扫描批量上限（防一轮处理过多阻塞）。
 	sweepBatchSize int32
 }
@@ -94,18 +108,29 @@ type Config struct {
 	Limits *video.ConcurrencyLimits
 	// CallbackBaseURL 回调入口 base URL；空 → 纯轮询兜底（不注册回调，6a）。
 	CallbackBaseURL string
-	SubmitLeaseTTL  time.Duration
-	SettleTimeout   time.Duration
-	PollTimeout     time.Duration
-	WorkerID        string
+
+	// ObjectStoreFactory 由 per-channel TOS 凭据构造结果对象存储（Unit 9）；nil → 结果转存禁用。
+	ObjectStoreFactory func(storage.TOSConfig) (storage.ObjectStore, error)
+	// ResultHTTPClient 拉取上游产物的 HTTP 客户端（Unit 9）；nil → 默认带超时。
+	ResultHTTPClient *http.Client
+	// MaxResultBytes 产物最大字节（Unit 9）；<=0 回落默认。
+	MaxResultBytes int64
+	// AllowPrivateResultHost 仅测试置 true（放行 httptest 环回）；生产留 false（SSRF 私网拒绝）。
+	AllowPrivateResultHost bool
+
+	SubmitLeaseTTL time.Duration
+	SettleTimeout  time.Duration
+	PollTimeout    time.Duration
+	WorkerID       string
 
 	// 6b sweep 阈值/批量（零值回落默认；测试可注入小值）。
-	SubmittedNoJobAge   time.Duration
-	StuckUpstreamAge    time.Duration
-	StuckSettlingAge    time.Duration
-	MaxExecutionAge     time.Duration
-	OrphanReserveMinAge time.Duration
-	SweepBatchSize      int32
+	SubmittedNoJobAge    time.Duration
+	StuckUpstreamAge     time.Duration
+	StuckSettlingAge     time.Duration
+	MaxExecutionAge      time.Duration
+	OrphanReserveMinAge  time.Duration
+	StoreNeedingStoreAge time.Duration
+	SweepBatchSize       int32
 }
 
 // 默认时长（Config 未给时回落）。
@@ -125,6 +150,14 @@ const (
 	defaultMaxExecutionAge     = 48 * time.Hour // seedance execution_expires_after 默认 48h
 	defaultOrphanReserveMinAge = 15 * time.Minute
 	defaultSweepBatchSize      = 100
+
+	// Unit 9 结果转存默认值。
+	defaultMaxResultBytes     = 512 << 20       // 512 MiB 产物上限（防 OOM；text_to_video 实际远小）
+	defaultResultFetchTimeout = 5 * time.Minute // 拉取大产物总超时
+	// storeNeedingStoreAge SETTLED 后多久仍无 oss_object_meta 判「store 丢失」→ 恢复重投（6b）。
+	defaultStoreNeedingStoreAge = 3 * time.Minute
+	// resultURLValidWindow 上游产物 URL 有效窗口（ADR-0006：seedance video_url 仅 24h）；超窗不再重投转存。
+	resultURLValidWindow = 24 * time.Hour
 )
 
 // NewService 构造 Service + fail-fast 必填校验。
@@ -139,28 +172,33 @@ func NewService(cfg Config) (*Service, error) {
 		return nil, errors.New("task.NewService: Logger 不能为 nil")
 	}
 	s := &Service{
-		pool:            cfg.Pool,
-		q:               db.New(cfg.Pool),
-		ledger:          cfg.Ledger,
-		adapter:         cfg.Adapter,
-		catalog:         cfg.Catalog,
-		creds:           cfg.Creds,
-		enqueuer:        cfg.Enqueuer,
-		logger:          cfg.Logger,
-		cap:             cfg.ConcurrencyCap,
-		limits:          cfg.Limits,
-		callbackBaseURL: cfg.CallbackBaseURL,
-		submitLeaseTTL:  cfg.SubmitLeaseTTL,
-		settleTO:        cfg.SettleTimeout,
-		pollTO:          cfg.PollTimeout,
-		workerID:        cfg.WorkerID,
+		pool:                   cfg.Pool,
+		q:                      db.New(cfg.Pool),
+		ledger:                 cfg.Ledger,
+		adapter:                cfg.Adapter,
+		catalog:                cfg.Catalog,
+		creds:                  cfg.Creds,
+		enqueuer:               cfg.Enqueuer,
+		logger:                 cfg.Logger,
+		cap:                    cfg.ConcurrencyCap,
+		limits:                 cfg.Limits,
+		callbackBaseURL:        cfg.CallbackBaseURL,
+		objectStoreFactory:     cfg.ObjectStoreFactory,
+		resultHTTPClient:       cfg.ResultHTTPClient,
+		maxResultBytes:         cfg.MaxResultBytes,
+		allowPrivateResultHost: cfg.AllowPrivateResultHost,
+		submitLeaseTTL:         cfg.SubmitLeaseTTL,
+		settleTO:               cfg.SettleTimeout,
+		pollTO:                 cfg.PollTimeout,
+		workerID:               cfg.WorkerID,
 
-		submittedNoJobAge:   cfg.SubmittedNoJobAge,
-		stuckUpstreamAge:    cfg.StuckUpstreamAge,
-		stuckSettlingAge:    cfg.StuckSettlingAge,
-		maxExecutionAge:     cfg.MaxExecutionAge,
-		orphanReserveMinAge: cfg.OrphanReserveMinAge,
-		sweepBatchSize:      cfg.SweepBatchSize,
+		submittedNoJobAge:    cfg.SubmittedNoJobAge,
+		stuckUpstreamAge:     cfg.StuckUpstreamAge,
+		stuckSettlingAge:     cfg.StuckSettlingAge,
+		maxExecutionAge:      cfg.MaxExecutionAge,
+		orphanReserveMinAge:  cfg.OrphanReserveMinAge,
+		storeNeedingStoreAge: cfg.StoreNeedingStoreAge,
+		sweepBatchSize:       cfg.SweepBatchSize,
 	}
 	if s.cap <= 0 {
 		s.cap = defaultConcurrencyCap
@@ -192,8 +230,17 @@ func NewService(cfg Config) (*Service, error) {
 	if s.orphanReserveMinAge <= 0 {
 		s.orphanReserveMinAge = defaultOrphanReserveMinAge
 	}
+	if s.storeNeedingStoreAge <= 0 {
+		s.storeNeedingStoreAge = defaultStoreNeedingStoreAge
+	}
 	if s.sweepBatchSize <= 0 {
 		s.sweepBatchSize = defaultSweepBatchSize
+	}
+	if s.resultHTTPClient == nil {
+		s.resultHTTPClient = &http.Client{Timeout: defaultResultFetchTimeout}
+	}
+	if s.maxResultBytes <= 0 {
+		s.maxResultBytes = defaultMaxResultBytes
 	}
 	return s, nil
 }

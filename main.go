@@ -47,6 +47,7 @@ import (
 	"github.com/sunxin-git/api-gateway/internal/outbox"
 	"github.com/sunxin-git/api-gateway/internal/relay"
 	"github.com/sunxin-git/api-gateway/internal/relay/video"
+	"github.com/sunxin-git/api-gateway/internal/storage"
 	"github.com/sunxin-git/api-gateway/internal/task"
 )
 
@@ -80,6 +81,8 @@ const (
 	// upstreamHTTPTimeout relay 调上游 chat completions 的客户端总超时（plan §决策 D2）。
 	// 同步非流式场景 60s 足够；超时 → ErrUpstreamTimeout → Release reserve + 504。
 	upstreamHTTPTimeout = 60 * time.Second
+	// resultFetchTimeout 拉取上游产物（视频 mp4，可能数十 MB）的总超时（Unit 9 结果转存）。
+	resultFetchTimeout = 5 * time.Minute
 )
 
 func main() {
@@ -750,18 +753,30 @@ func buildVideoTaskService(
 		return nil, nil, fmt.Errorf("装配并发上限解析器: %w", err)
 	}
 
+	// Unit 9 结果转存：注入 TOS ObjectStore 工厂（per-channel 凭据即用即弃构造）+ 拉取产物的 HTTP 客户端。
+	// 工厂非 nil ⟹ 启用结果转存（settle 成功后入队 store + 周期 recoverMissingStore 兜底）。
+	// 禁止跟随重定向（与 videoUpstreamClient 一致）：防上游产物 URL 被劫持后 3xx 重定向到内网（SSRF 链）。
+	resultFetchClient := &http.Client{
+		Timeout: resultFetchTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
 	svc, err := task.NewService(task.Config{
-		Pool:            pool,
-		Ledger:          ledgerSvc,
-		Adapter:         adapter,
-		Catalog:         catalog,
-		Creds:           channelSvc,
-		Enqueuer:        enqueuer,
-		Logger:          log,
-		WorkerID:        hostnameOrUnknown(),
-		Limits:          limits,                   // Unit 8：账户×模型并发上限（DB 原子 claim 的 cap）
-		CallbackBaseURL: cfg.VideoCallbackBaseURL, // Unit 8：空 → 纯轮询兜底
-		// 各超时 / sweep 阈值用 task 包默认。
+		Pool:               pool,
+		Ledger:             ledgerSvc,
+		Adapter:            adapter,
+		Catalog:            catalog,
+		Creds:              channelSvc,
+		Enqueuer:           enqueuer,
+		Logger:             log,
+		WorkerID:           hostnameOrUnknown(),
+		Limits:             limits,                    // Unit 8：账户×模型并发上限（DB 原子 claim 的 cap）
+		CallbackBaseURL:    cfg.VideoCallbackBaseURL,  // Unit 8：空 → 纯轮询兜底
+		ObjectStoreFactory: storage.NewTOSObjectStore, // Unit 9：TOS 结果转存（官方 SDK，ADR-0006 决策 3）
+		ResultHTTPClient:   resultFetchClient,         // Unit 9：拉取上游产物
+		// 各超时 / sweep 阈值 / MaxResultBytes 用 task 包默认。
 	})
 	if err != nil {
 		_ = enqueuer.Close()

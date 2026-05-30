@@ -41,15 +41,16 @@ const (
 // fetch reconciler（回调缺失 / 入队丢失 / 卡 SETTLING 的轮询兜底）
 // =============================================================================
 
-// fetchReconcileOnce 跑一轮 fetch reconciler（scheduled，QueueLow）。三段各自独立扫描 + 处理：
+// fetchReconcileOnce 跑一轮 fetch reconciler（scheduled，QueueLow）。各段独立扫描 + 处理：
 //
 //	① SUBMITTED 滞留（超 submittedNoJobAge，入队丢失 / Redis 抖动无 Asynq job）→ 幂等重投 submit；
-//	② stuck SETTLING（超 stuckSettlingAge，硬崩溃于结算落账后、终态 CAS 前）→ recoverSettling 幂等恢复；
-//	③ stuck UPSTREAM_SUBMITTED（超 stuckUpstreamAge 未终态）→ 主动 Poll 上游 → 命中终态则 markUpstreamTerminal。
+//	② missing store（SETTLED/COMPLETED 来源超阈值仍无 oss_object_meta，24h 窗内）→ 幂等重投 store（Unit 9）；
+//	③ stuck SETTLING（超 stuckSettlingAge，硬崩溃于结算落账后、终态 CAS 前）→ recoverSettling 幂等恢复；
+//	④ stuck UPSTREAM_SUBMITTED（超 stuckUpstreamAge 未终态）→ 主动 Poll 上游 → 命中终态则 markUpstreamTerminal。
 //
-// **次序刻意**：先跑两段纯 DB（快），最后跑唯一的逐条网络 Poll 段（慢，受上游时延支配）——
-// 避免上游慢时 Poll 段拖长本轮、饿死动钱相关的 SETTLING 恢复（ce-review 并发 pile-up 缓解）。
-// 三段错误互不阻断；用 errors.Join 汇总所有扫描错误供 asynq 记录（下一 tick 自然重试，不丢失任一段失败信号）。
+// **次序刻意**：先跑纯 DB / 仅入队的快段（①②③），最后跑唯一的逐条网络 Poll 段（④，慢，受上游时延
+// 支配）——避免上游慢时 Poll 段拖长本轮、饿死动钱相关的 SETTLING 恢复（ce-review 并发 pile-up 缓解）。
+// 各段错误互不阻断；用 errors.Join 汇总所有扫描错误供 asynq 记录（下一 tick 自然重试，不丢失任一段失败信号）。
 func (s *Service) fetchReconcileOnce(ctx context.Context) error {
 	var errs error
 	record := func(stage string, err error) {
@@ -61,6 +62,7 @@ func (s *Service) fetchReconcileOnce(ctx context.Context) error {
 		errs = errors.Join(errs, err)
 	}
 	record("submitted_no_job", s.reenqueueSubmittedNoJob(ctx))
+	record("missing_store", s.recoverMissingStore(ctx))
 	record("stuck_settling", s.recoverStuckSettling(ctx))
 	record("stuck_upstream_submitted", s.pollStuckUpstreamSubmitted(ctx))
 	return errs

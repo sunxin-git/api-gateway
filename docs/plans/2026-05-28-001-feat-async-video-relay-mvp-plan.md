@@ -406,7 +406,7 @@ settle_minor  = ceil( settle_tokens / 1_000_000 × 快照单价 × 快照倍率 
 
 ### Phase 4 — 对外面、存储、运维
 
-- [ ] **Unit 9: TOS 结果存储 + 签名 URL**
+- [x] **Unit 9: TOS 结果存储 + 签名 URL**（internal/storage/tos.go: ObjectStore 接口 + 火山官方 SDK ve-tos-golang-sdk/v2 实现(PutObjectV2+ForbidOverwrite / PreSignedURL 离线现签 / ErrObjectExists 归一)；migrations/0010 oss_object_meta + 专用部分索引 + sqlc；独立 video:store Asynq job：settle 成功→入队→re-poll 产物 URL→fetch→Put→写 meta，确定性 key 幂等；6b fetchReconcileOnce 加 recoverMissingStore 兜底(24h 窗内)。签名 URL 读时现签不入库。已 ce-review(security/adversarial/reliability/data-migrations/correctness/testing/project-standards)：修 projectID 路径穿越净化、产物 URL SSRF 防护(禁重定向+scheme+私网拒绝,测试放行环回)、429→可重试、超 24h 毒丸防护、ScanSettledNeedingStore 部分索引、go mod tidy(ve-tos direct)；补 fetch 分类/SSRF/key 净化/recover 负向过滤测试。已推送。**残留**：真实 TOS PutObjectV2 仅 fake 覆盖(待 bucket 凭据集成测)、DNS rebinding、签名 URL TTL/读路径=Unit 10。）
 
 **Goal:** 任务成功后将产物落企业 TOS bucket + 生成受限签名 URL，记录 oss_object_meta。
 

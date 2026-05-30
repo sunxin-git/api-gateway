@@ -88,15 +88,16 @@ func (s *Service) settleCompleted(t db.Task, snap TaskFinancialSnapshot) error {
 	}
 	actor := ledger.Actor{Type: ledger.ActorTypeTask, ID: t.ID}
 	if err := s.commitWithRetry(actor, t.BusinessAccountID, snap.ReservationCorrelationID, settleMinor); err != nil {
-		// 已 SETTLED 过（双 settle）→ 幂等成功，推进终态
+		// 已 SETTLED 过（双 settle）→ 幂等成功，推进终态 + 触发结果转存
 		if errors.Is(err, ledger.ErrAlreadySettled) {
-			return s.casSettled(t.ID)
+			return s.settleSucceeded(t.ID)
 		}
 		s.logger.Error("task.settle: commit 永久失败 → settle_failed（reserve 留对账）",
 			slog.String("task_id", t.ID), slog.String("err", err.Error()))
 		return s.casSettleFailed(t.ID)
 	}
-	return s.casSettled(t.ID)
+	// 成功结算 → 推进 SETTLED + 触发结果转存（Unit 9，best-effort）。
+	return s.settleSucceeded(t.ID)
 }
 
 // settleReleased 失败终态结算：release reserve 全额回退。
