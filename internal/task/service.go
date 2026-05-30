@@ -1,0 +1,367 @@
+package task
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/sunxin-git/api-gateway/internal/channel"
+	"github.com/sunxin-git/api-gateway/internal/db"
+	"github.com/sunxin-git/api-gateway/internal/ledger"
+	"github.com/sunxin-git/api-gateway/internal/relay/video"
+)
+
+// referenceTypeVideoTask ledger reserve/commit/release 的 reference_type（运维按此 SUM 对账）。
+const referenceTypeVideoTask = "video_task"
+
+// ErrConcurrencyLimit 提交时账户×模型并发 claim 占不到位（R15 上限）；handler 映射 429。
+var ErrConcurrencyLimit = errors.New("task: 账户×模型并发已达上限")
+
+// CredentialResolver 解密上游凭据的最小依赖（channel.Service 满足；测试可 fake）。
+type CredentialResolver interface {
+	GetCredentialsForUpstream(ctx context.Context, id int64) (*channel.ChannelCredentials, error)
+}
+
+// Service 异步视频任务服务：提交流程 + 状态机 CAS 封装 + settle 编排（plan §Unit 6）。
+//
+// 持久依赖经构造注入（DIP）；不持隐式全局 state。所有状态变更走带 from 条件的 CAS。
+type Service struct {
+	pool     *pgxpool.Pool
+	q        *db.Queries
+	ledger   ledger.Service
+	adapter  video.AsyncProviderAdapter
+	catalog  video.VideoCatalog
+	creds    CredentialResolver
+	enqueuer Enqueuer
+	logger   *slog.Logger
+
+	// cap R15 静态默认并发上限（Unit 8 接入 per-account×model 覆写）。
+	cap int32
+	// submitLeaseTTL submit worker 抢占 lease 时长（recover 据此判过期，6b）。
+	submitLeaseTTL time.Duration
+	// settleTO settle 的 ledger commit/release 独立 ctx 超时。
+	settleTO time.Duration
+	// pollTO settle 内 Poll 反查上游 usage 的独立超时。
+	pollTO time.Duration
+	// workerID 标识本进程（写入 submit_locked_by，便于排查）。
+	workerID string
+}
+
+// Config 构造 Service 的参数。
+type Config struct {
+	Pool     *pgxpool.Pool
+	Ledger   ledger.Service
+	Adapter  video.AsyncProviderAdapter
+	Catalog  video.VideoCatalog
+	Creds    CredentialResolver
+	Enqueuer Enqueuer
+	Logger   *slog.Logger
+
+	ConcurrencyCap int32
+	SubmitLeaseTTL time.Duration
+	SettleTimeout  time.Duration
+	PollTimeout    time.Duration
+	WorkerID       string
+}
+
+// 默认时长（Config 未给时回落）。
+const (
+	defaultSubmitLeaseTTL = 2 * time.Minute
+	defaultSettleTimeout  = 5 * time.Second
+	defaultPollTimeout    = 10 * time.Second
+	defaultConcurrencyCap = 5
+)
+
+// NewService 构造 Service + fail-fast 必填校验。
+func NewService(cfg Config) (*Service, error) {
+	if cfg.Pool == nil {
+		return nil, errors.New("task.NewService: Pool 不能为 nil")
+	}
+	if cfg.Ledger == nil || cfg.Adapter == nil || cfg.Catalog == nil || cfg.Creds == nil || cfg.Enqueuer == nil {
+		return nil, errors.New("task.NewService: Ledger/Adapter/Catalog/Creds/Enqueuer 均不能为 nil")
+	}
+	if cfg.Logger == nil {
+		return nil, errors.New("task.NewService: Logger 不能为 nil")
+	}
+	s := &Service{
+		pool:           cfg.Pool,
+		q:              db.New(cfg.Pool),
+		ledger:         cfg.Ledger,
+		adapter:        cfg.Adapter,
+		catalog:        cfg.Catalog,
+		creds:          cfg.Creds,
+		enqueuer:       cfg.Enqueuer,
+		logger:         cfg.Logger,
+		cap:            cfg.ConcurrencyCap,
+		submitLeaseTTL: cfg.SubmitLeaseTTL,
+		settleTO:       cfg.SettleTimeout,
+		pollTO:         cfg.PollTimeout,
+		workerID:       cfg.WorkerID,
+	}
+	if s.cap <= 0 {
+		s.cap = defaultConcurrencyCap
+	}
+	if s.submitLeaseTTL <= 0 {
+		s.submitLeaseTTL = defaultSubmitLeaseTTL
+	}
+	if s.settleTO <= 0 {
+		s.settleTO = defaultSettleTimeout
+	}
+	if s.pollTO <= 0 {
+		s.pollTO = defaultPollTimeout
+	}
+	if s.workerID == "" {
+		s.workerID = "task-worker"
+	}
+	return s, nil
+}
+
+// =============================================================================
+// 提交流程
+// =============================================================================
+
+// SubmitParams 提交入参（鉴权/entitlement/能力校验/billing 由调用方 Unit 10 handler 完成）。
+type SubmitParams struct {
+	BusinessAccountID string
+	// ActorTokenID 业务 API Key 自增 ID（写 task.token_id；nil = 不记）。
+	ActorTokenID *int64
+	// ChannelID 绑定的 channel id（caller 已由 ChannelName 解析；nil = 不绑）。
+	ChannelID *int64
+	// Entry catalog 条目（路由 + pricing）。
+	Entry *video.VideoModelEntry
+	// Request 已校验+规范化请求（Unit 4）。
+	Request *video.ValidatedRequest
+
+	// --- billing（caller 经 Unit 7 估算）---
+	ReserveMinor  int64 // 预占金额（> 0）
+	ReserveTokens int64 // token 上界
+	MinTokenFloor int64 // 最低 token 计费下限
+
+	// CallbackToken 回调 token（Unit 8 生成；6a 为空 = 纯轮询）。
+	CallbackToken string
+}
+
+// Submit 执行提交流程（plan §Unit 6 Approach 事务边界）：
+//
+//	reserve（独立 ledger tx） → 单 tx{claim 占位 + 落 task} → 入队 submit job → 返 task_id
+//
+// 失败处理：claim/落库失败 → Release reserve（无 orphan）；claim 占不到 → ErrConcurrencyLimit(429)；
+// 入队失败非致命（task 已 SUBMITTED，reconciler 6b 重投）。reserve 错误（余额/冻结）原样上抛
+// （含 ledger sentinel，handler errors.Is 映射）。
+func (s *Service) Submit(ctx context.Context, p SubmitParams) (string, error) {
+	if p.Entry == nil || p.Request == nil {
+		return "", errors.New("task.Submit: Entry / Request 不能为 nil")
+	}
+	if p.ReserveMinor <= 0 {
+		return "", errors.New("task.Submit: ReserveMinor 必须 > 0")
+	}
+	tier, ok := p.Entry.Pricing.Tier(p.Request.Resolution)
+	if !ok {
+		return "", fmt.Errorf("task.Submit: 分辨率 %q 无定价（catalog 不一致）", p.Request.Resolution)
+	}
+
+	taskID := newTaskID()
+	correlation := taskID // 钉死 reserve↔commit/release 同 correlation（plan §Unit 7）
+	snap := TaskFinancialSnapshot{
+		GatewayModel:               p.Entry.GatewayModelName,
+		UpstreamModel:              p.Entry.UpstreamModelName,
+		ProviderType:               p.Entry.UpstreamProviderType,
+		ChannelName:                p.Entry.ChannelName,
+		TaskType:                   string(p.Request.TaskType),
+		Prompt:                     p.Request.Prompt,
+		Duration:                   p.Request.Duration,
+		Resolution:                 p.Request.Resolution,
+		Ratio:                      p.Request.Ratio,
+		Fps:                        p.Request.Fps,
+		ReservationCorrelationID:   correlation,
+		ReserveMinor:               p.ReserveMinor,
+		ReserveTokens:              p.ReserveTokens,
+		PricePerMillionTokensMinor: tier.PricePerMillionTokensMinor,
+		BillingMultiplierBP:        p.Entry.Pricing.BillingMultiplierBP,
+		MinTokenFloor:              p.MinTokenFloor,
+	}
+	snapBytes, err := snap.Marshal()
+	if err != nil {
+		return "", fmt.Errorf("task.Submit: 组装 financial_snapshot 失败: %w", err)
+	}
+
+	actor := ledger.Actor{Type: ledger.ActorTypeTask, ID: taskID}
+
+	// 1. Reserve（独立 ledger tx）
+	if _, err := s.ledger.Reserve(ctx, actor, ledger.ReserveParams{
+		AccountID:     p.BusinessAccountID,
+		Amount:        p.ReserveMinor,
+		CorrelationID: correlation,
+		ReferenceType: referenceTypeVideoTask,
+		ReferenceID:   taskID,
+	}); err != nil {
+		return "", fmt.Errorf("task.Submit reserve: %w", err) // 保留 ledger sentinel
+	}
+
+	// 2. 单 tx：claim 占位 + 落 task。任一失败 → Release reserve（无 orphan）。
+	if err := s.claimAndInsert(ctx, p, taskID, snapBytes); err != nil {
+		s.releaseReserveBestEffort(actor, p.BusinessAccountID, correlation, p.ReserveMinor, "submit_tx_failed")
+		return "", err
+	}
+
+	// 3. 入队 submit（失败非致命：task 已 SUBMITTED，6b reconciler 扫 ScanSubmittedNoJob 重投）。
+	if err := s.enqueuer.EnqueueSubmit(ctx, taskID); err != nil {
+		s.logger.Error("task: 入队 submit job 失败；task 已落库 SUBMITTED，待 reconciler 重投",
+			slog.String("task_id", taskID), slog.String("err", err.Error()))
+	}
+	return taskID, nil
+}
+
+// claimAndInsert 单 tx 内原子占并发位 + 落 task。
+func (s *Service) claimAndInsert(ctx context.Context, p SubmitParams, taskID string, snapBytes []byte) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("task.Submit begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // 成功 Commit 后再 Rollback 无害
+
+	q := s.q.WithTx(tx)
+
+	// claim 占位：占不到（pgx.ErrNoRows）= 已达 cap = 429
+	if _, err := q.ClaimConcurrencySlot(ctx, db.ClaimConcurrencySlotParams{
+		BusinessAccountID: p.BusinessAccountID,
+		Model:             p.Entry.GatewayModelName,
+		CapLimit:          s.cap,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrConcurrencyLimit
+		}
+		return fmt.Errorf("task.Submit claim: %w", err)
+	}
+
+	if _, err := q.InsertTask(ctx, db.InsertTaskParams{
+		ID:                taskID,
+		BusinessAccountID: p.BusinessAccountID,
+		TokenID:           pgInt8OrNull(p.ActorTokenID),
+		ChannelID:         pgInt8OrNull(p.ChannelID),
+		ProviderType:      p.Entry.UpstreamProviderType,
+		Model:             p.Entry.GatewayModelName,
+		FinancialSnapshot: snapBytes,
+		AccountingMonth:   accountingMonth(time.Now()),
+		CallbackToken:     pgTextOrNull(p.CallbackToken),
+	}); err != nil {
+		return fmt.Errorf("task.Submit insert: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("task.Submit commit tx: %w", err)
+	}
+	return nil
+}
+
+// =============================================================================
+// 状态机 CAS 封装
+// =============================================================================
+
+// markUpstreamTerminal 把任务 CAS 进上游终态（COMPLETED/FAILED/CANCELLED/EXPIRED），
+// **同事务释放并发 claim**，CAS 赢家唯一入队 settle（plan §Unit 6 / ADR-0006 决策 2）。
+//
+// 被 submit worker（提交失败）、6b reconciler/recover/expire 复用。CAS 输（他人已推进）→
+// 不释放 claim（防 double-release）、不入队 settle，返回 (false, nil)。
+func (s *Service) markUpstreamTerminal(
+	ctx context.Context, taskID string, from, to db.TaskStatus,
+	errCode, errMsg, accountID, model string,
+) (won bool, err error) {
+	if !isUpstreamTerminal(to) {
+		return false, fmt.Errorf("task.markUpstreamTerminal: %q 非上游终态", to)
+	}
+	if !canTransition(from, to) {
+		return false, fmt.Errorf("task.markUpstreamTerminal: 非法转移 %q→%q", from, to)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := s.q.WithTx(tx)
+
+	affected, err := q.MarkTaskUpstreamTerminal(ctx, db.MarkTaskUpstreamTerminalParams{
+		ToStatus:     to,
+		ErrorCode:    pgTextOrNull(errCode),
+		ErrorMessage: pgTextOrNull(errMsg),
+		ID:           taskID,
+		FromStatus:   from,
+	})
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil // CAS 输：他人已推进，幂等放弃
+	}
+	// 同事务释放 claim（进上游终态即释放并发槽）
+	if _, err := q.ReleaseConcurrencySlot(ctx, db.ReleaseConcurrencySlotParams{
+		BusinessAccountID: accountID,
+		Model:             model,
+	}); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	// 赢家唯一入队 settle（去抖；失败非致命，6b reconciler 兜底重投）
+	if err := s.enqueuer.EnqueueSettle(ctx, taskID); err != nil {
+		s.logger.Error("task: 入队 settle 失败；待 reconciler 重投",
+			slog.String("task_id", taskID), slog.String("err", err.Error()))
+	}
+	return true, nil
+}
+
+// resolveCreds 解密 channel 凭据并映射为上游 adapter 凭据（即用即弃，绝不入日志）。
+func (s *Service) resolveCreds(ctx context.Context, channelID pgtype.Int8) (video.UpstreamCredentials, error) {
+	if !channelID.Valid {
+		return video.UpstreamCredentials{}, errors.New("task: 任务无 channel_id，无法取上游凭据")
+	}
+	cc, err := s.creds.GetCredentialsForUpstream(ctx, channelID.Int64)
+	if err != nil {
+		return video.UpstreamCredentials{}, err
+	}
+	return video.UpstreamCredentials{APIKey: cc.APIKey}, nil
+}
+
+// =============================================================================
+// helpers
+// =============================================================================
+
+// newTaskID 生成全局唯一 task_id（"vtask_" + 16 字节随机 hex）。
+func newTaskID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return "vtask_" + hex.EncodeToString(b[:])
+}
+
+// accountingMonth 取计费归属月（UTC YYYY-MM）。
+func accountingMonth(now time.Time) string {
+	return now.UTC().Format("2006-01")
+}
+
+func pgInt8OrNull(p *int64) pgtype.Int8 {
+	if p == nil {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: *p, Valid: true}
+}
+
+func pgTextOrNull(s string) pgtype.Text {
+	if s == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: s, Valid: true}
+}
+
+func nullTime(t time.Time) sql.NullTime {
+	return sql.NullTime{Time: t, Valid: true}
+}
